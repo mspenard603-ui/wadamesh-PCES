@@ -1219,28 +1219,16 @@ public:
   /** The advert "feature 1" word a node last announced (ADV_FEAT1_MASK), or 0.
    *  MeshCore parses and then drops it; Commsol uses it as a service marker
    *  (0xC5xx = a Commsol node, bit 1 = answers PCES, bit 0 = room slash commands).
-   *  Served from a small RAM cache filled by onAdvertRecv; on a miss (adverts heard
-   *  before this boot) it is recovered from the stored raw advert blob, and that
-   *  answer is cached too so a contacts() walk reads flash at most once per node. */
-  uint16_t advertFeat1(const uint8_t pub_key[PUB_KEY_SIZE]) {
+   *  RAM only, filled by onAdvertRecv: a node shows its marker from its first advert
+   *  heard after boot. Deliberately never falls back to the stored advert blobs --
+   *  the contact list asks this for every row while it draws, and a file read per
+   *  row from the UI thread (on the T-Deck: the SD card, sharing SPI with the radio
+   *  and the display) locked the Contacts screen up. */
+  uint16_t advertFeat1(const uint8_t pub_key[PUB_KEY_SIZE]) const {
     uint32_t pfx; memcpy(&pfx, pub_key, 4);
     for (uint8_t i = 0; i < kFeat1Slots; ++i)
-      if (_feat1_pfx[i] == pfx && _feat1_known[i]) return _feat1_val[i];
-    uint16_t f = 0;
-    uint8_t blob[MAX_TRANS_UNIT + 1];
-    const int n = _store ? _store->getBlobByKey(pub_key, PUB_KEY_SIZE, blob) : 0;
-    if (n > 0 && n <= MAX_TRANS_UNIT) {
-      mesh::Packet pkt;
-      // An advert payload is pub_key(32) + timestamp(4) + signature(64) + app_data.
-      const int kAppDataAt = PUB_KEY_SIZE + 4 + SIGNATURE_SIZE;
-      if (pkt.readFrom(blob, (uint8_t)n) && pkt.getPayloadType() == PAYLOAD_TYPE_ADVERT &&
-          pkt.payload_len > kAppDataAt) {
-        AdvertDataParser p(&pkt.payload[kAppDataAt], (uint8_t)(pkt.payload_len - kAppDataAt));
-        f = p.getFeat1();
-      }
-    }
-    rememberFeat1(pub_key, f);
-    return f;
+      if (_feat1_known[i] && _feat1_pfx[i] == pfx) return _feat1_val[i];
+    return 0;
   }
 
   /** Re-broadcast a contact's advert as a zero-hop packet so nodes in direct
@@ -1528,7 +1516,12 @@ private:
     uint16_t feat1 = 0;
     if (app_data && app_data_len > 0) {
       AdvertDataParser p(app_data, (uint8_t)app_data_len);
-      if (p.isValid()) { feat1 = p.getFeat1(); rememberFeat1(id.pub_key, feat1); }
+      // Remember only nodes that announce something: ordinary adverts must not push a
+      // PCES server out of the 64-slot cache. A node that drops its marker is cleared.
+      if (p.isValid()) {
+        feat1 = p.getFeat1();
+        if (feat1 || advertFeat1(id.pub_key)) rememberFeat1(id.pub_key, feat1);
+      }
     }
     BaseChatMesh::onAdvertRecv(packet, id, timestamp, app_data, app_data_len);
     // A PCES server's advert that reached us through relays: note the relay next to us
