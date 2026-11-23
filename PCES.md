@@ -15,7 +15,7 @@ its plumbing. The Lua SDK is unchanged.
 ## Using it
 
 1. Open a contact's action sheet (tap it in Contacts) and choose **PCES route**.
-2. **Server.** The screen uses the first repeater or room that advertises the PCES marker. Its advert feature 1 is `0xC5xx` with bit 1 set, and the station's repeater identity advertises `0xC502`. The marker is optional, so when no contact advertises it, the screen lists your repeaters and rooms to pick from. **Server info** asks the station for INFO: link count, data window, newest measurement age and SF.
+2. **Server.** A server you pick is saved and kept across reboots; **Clear saved server** forgets it. With nothing saved, the screen uses the first repeater or room that advertises the PCES marker. Its advert feature 1 is `0xC5xx` with bit 1 set, and the station's repeater identity advertises `0xC502`. The marker is optional, so when no contact advertises it, the screen lists your repeaters and rooms to pick from. **Server info** asks the station for INFO: link count, data window, newest measurement age and SF.
 3. **Ask PCES for a route.** Following the spec, A is your first hop, the first relay of the contact's current route. B is the contact itself when it is a repeater or room, otherwise the last relay of its route. A contact with no route yet can't be planned: message it once so MeshCore learns a path.
 4. The first ask logs in to the server with a blank password, which the station accepts as a PCES-only guest. It waits 2.5 s, so the request doesn't collide with the re-flooded login reply, then sends `C5 01 01 [width] A B`. The guest session is reused for 15 minutes.
 5. **Answer.** The screen shows the metric (0 to 100), the weakest-leg SNR, the PCES path and the route that would be installed. Nothing changes until you tap **Use this route**. The replaced route is kept, and **Restore route** puts it back.
@@ -44,6 +44,9 @@ On-air etiquette from the Commsol spec, enforced by the screen and the automatic
 - At most one request every 12 s, so 5 a minute, matching the server's limit.
 - It shares the UI's single-flight request slot, so it waits behind status, telemetry and admin requests and never clobbers them.
 
+Contacts that advertise PCES (repeaters and rooms whose feature 1 is `0xC5xx` with
+bit 1 set) carry a **PCES** badge after their name in the contact list.
+
 ## Code
 
 | File | What |
@@ -51,7 +54,8 @@ On-air etiquette from the Commsol spec, enforced by the screen and the automatic
 | `src/helpers/PcesProto.h` | Pure codec: INFO/PATH/LINK encode and decode, status texts, the feature-1 marker, A/B planning and answer-to-route conversion. No Arduino or LVGL. |
 | `src/ui-touch/PcesApp.h` | The screen. It is included into `UITask.cpp` after `RepeaterAdminApp.h` and shares its helpers. Login goes through `uiSendAdminLogin`, the request through `uiSendBinaryRequest`, and replies are routed from `UITask::onAdminLoginResult` / `onBinaryReply`. |
 | `src/MyMesh.h` | `onAdvertRecv` override that keeps advert feature 1, which the core parses and drops, and records PCES server adverts heard through relays (`takePcesAdvert`). `advertFeat1()` reads it from a 64-entry RAM cache, falling back to the stored advert blob. `uiSetContactPath()` installs a route. |
-| `src/ui-touch/UITask.cpp` | The "PCES route" button on the contact action sheet, the reply hooks, and Back/Esc via the popup registry. |
+| `src/helpers/esp32/TouchPrefsStore.*` | `touchPrefsGet/SetPcesServer`: the saved server, as a 32-byte key in NVS (`pces_srv`). |
+| `src/ui-touch/UITask.cpp` | The PCES badge on contact rows, the "PCES route" button on the contact action sheet, the reply hooks, and Back/Esc via the popup registry. |
 | `web/mesh/WebMesh.*` | Stand-ins for the browser and host builds. Routes are only mirrored there. |
 | `web/mesh/DemoBackend.cpp` | With `WADA_DEMO_PCES=1`, Hilltop Repeater answers as a canned PCES station and Diego has a 2-hop route to improve. `WADA_DEMO_PCES_ADVERT=1` (in `WebMesh.cpp`) fakes a PCES server advert. |
 
@@ -83,7 +87,6 @@ On-air etiquette from the Commsol spec, enforced by the screen and the automatic
 
 ## Not done in this proof of concept
 
-- No "PCES" badge in the contact list.
 - LINK is encoded and decoded but has no screen.
-- The chosen server and the saved "Restore" route live in RAM only. They are lost on reboot, and only the last replaced route is kept.
+- The saved "Restore" route lives in RAM only. It is lost on reboot, and only the last replaced route is kept.
 - Not yet tested on hardware or against a real station.

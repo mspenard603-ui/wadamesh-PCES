@@ -945,6 +945,7 @@ bool touchPrefsSetWebTerminal(bool on) {
 }
 
 static const char* KEY_WEB_TRUST = "web_trust";
+static const char* KEY_PCES_SERVER = "pces_srv";   // PCES server public key (32 bytes), absent = auto
 
 size_t touchPrefsGetWebTrust(void* out, size_t cap) {
   if (!s_begun) touchPrefsBegin();
@@ -958,6 +959,24 @@ bool touchPrefsSetWebTrust(const void* buf, size_t len) {
   bool ok;
   if (!buf || len == 0) { s_prefs.remove(KEY_WEB_TRUST); ok = true; }
   else ok = s_prefs.putBytes(KEY_WEB_TRUST, buf, len) == len;
+  s_prefs.end();
+  s_begun = s_prefs.begin(TOUCH_NS, true);
+  return ok;
+}
+
+// The PCES server the user picked (src/ui-touch/PcesApp.h), kept across reboots.
+// Absent = none picked: the PCES screen uses the first contact advertising PCES.
+bool touchPrefsGetPcesServer(uint8_t out[32]) {
+  if (!s_begun) touchPrefsBegin();
+  if (!out || !s_prefs.isKey(KEY_PCES_SERVER)) return false;
+  return s_prefs.getBytes(KEY_PCES_SERVER, out, 32) == 32;
+}
+bool touchPrefsSetPcesServer(const uint8_t* pub32) {   // null = forget
+  s_prefs.end();
+  if (!s_prefs.begin(TOUCH_NS, false)) return false;
+  bool ok;
+  if (!pub32) { s_prefs.remove(KEY_PCES_SERVER); ok = true; }
+  else ok = s_prefs.putBytes(KEY_PCES_SERVER, pub32, 32) == 32;
   s_prefs.end();
   s_begun = s_prefs.begin(TOUCH_NS, true);
   return ok;

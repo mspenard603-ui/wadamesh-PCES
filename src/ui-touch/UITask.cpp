@@ -51278,7 +51278,17 @@ static void refreshContactsList() {
     char san[40];
     copyUtf8ReplacingMissingGlyphs(&g_font_semi_14, san, sizeof(san), e.name);
     const lv_coord_t name_full = lv_txt_get_width(san, strlen(san), &g_font_semi_14, 0, LV_TEXT_FLAG_NONE);
-    const lv_coord_t name_w = LV_MAX((lv_coord_t)40, (lv_coord_t)LV_MIN(name_full, name_room - (e.is_fav ? star_w : 0)));
+    // PCES badge: a repeater or room advertising Commsol's path service (PcesApp.h).
+    bool is_pces = false;
+    if (is_rep || e.type == ADV_TYPE_ROOM) {
+      ContactInfo pc;
+      is_pces = the_mesh.getContactByIdx(static_cast<uint32_t>(e.mesh_idx), pc) &&
+                PcesProto::answersPces(the_mesh.advertFeat1(pc.id.pub_key));
+    }
+    const lv_coord_t pces_w = is_pces
+        ? (lv_coord_t)(lv_txt_get_width("PCES", 4, &g_font_semi_12, 0, LV_TEXT_FLAG_NONE) + 12) : 0;
+    const lv_coord_t name_w = LV_MAX((lv_coord_t)40, (lv_coord_t)LV_MIN(name_full,
+        name_room - (e.is_fav ? star_w : 0) - (is_pces ? pces_w + 6 : 0)));
     lv_obj_t* nm = lv_label_create(rb);
     lv_label_set_long_mode(nm, LV_LABEL_LONG_DOT);
     lv_label_set_text(nm, san);
@@ -51296,6 +51306,18 @@ static void refreshContactsList() {
       lv_obj_set_style_text_color(star, lightSurfaceTextColor(0xF2C14E), LV_PART_MAIN);
       lv_obj_align(star, LV_ALIGN_TOP_LEFT, text_x + name_w + 4,
                    (lv_coord_t)(name_base - (lv_font_get_line_height(&star_font_14) - star_font_14.base_line)));
+    }
+    if (is_pces) {
+      lv_obj_t* pb = lv_label_create(rb);
+      lv_label_set_text(pb, "PCES");
+      lv_obj_set_style_text_font(pb, &g_font_semi_12, LV_PART_MAIN);
+      lv_obj_set_style_text_color(pb, lv_color_hex(COLOR_GLOW), LV_PART_MAIN);
+      lv_obj_set_style_border_color(pb, lv_color_hex(COLOR_GLOW), LV_PART_MAIN);
+      lv_obj_set_style_border_width(pb, 1, LV_PART_MAIN);
+      lv_obj_set_style_radius(pb, 6, LV_PART_MAIN);
+      lv_obj_set_style_pad_hor(pb, 5, LV_PART_MAIN);
+      lv_obj_set_style_pad_ver(pb, 0, LV_PART_MAIN);
+      lv_obj_align(pb, LV_ALIGN_TOP_LEFT, text_x + name_w + 6 + (e.is_fav ? star_w : 0), kNameY + 1);
     }
 
     // What it is, and how we reach it: "Repeater · 2 hops", "Room · direct".

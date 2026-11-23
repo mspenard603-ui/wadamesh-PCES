@@ -45,6 +45,8 @@ struct PcesState {
   uint8_t  server[PUB_KEY_SIZE] = {0};
   bool     have_server = false;
   bool     server_marked = false;          // advertises the 0xC5xx PCES marker
+  bool     server_saved = false;           // the user picked it: kept across reboots (TouchPrefs)
+  bool     prefs_loaded = false;
   // Guest session at the server: a node forgets guests on reboot, so reuse it 15 min.
   uint8_t  session_server[PUB_KEY_SIZE] = {0};
   uint32_t session_ms = 0;
@@ -112,8 +114,35 @@ ContactInfo* pcesServer() {
 }
 bool pcesIsRelay(const ContactInfo& c) { return c.type == ADV_TYPE_REPEATER || c.type == ADV_TYPE_ROOM; }
 
-// The first contact advertising "answers PCES", unless the user picked one.
+// The saved server is the user's choice and survives reboots.
+void pcesLoadSaved() {
+  if (s_pces->prefs_loaded) return;
+  s_pces->prefs_loaded = true;
+#if defined(ESP32)
+  uint8_t k[PUB_KEY_SIZE];
+  if (touchPrefsGetPcesServer(k)) {
+    memcpy(s_pces->server, k, PUB_KEY_SIZE);
+    s_pces->have_server = s_pces->server_saved = true;
+  }
+#endif
+}
+void pcesSaveServer(const uint8_t* pub) {   // null = forget
+#if defined(ESP32)
+  touchPrefsSetPcesServer(pub);
+#else
+  (void)pub;
+#endif
+  s_pces->server_saved = pub != nullptr;
+}
+
+// The saved server if there is one (even while it is not a contact: the user chose
+// it), else the first contact advertising "answers PCES".
 void pcesFindServer() {
+  pcesLoadSaved();
+  if (s_pces->server_saved) {
+    s_pces->server_marked = PP::answersPces(the_mesh.advertFeat1(s_pces->server));
+    return;
+  }
   if (s_pces->have_server && pcesServer()) {
     s_pces->server_marked = PP::answersPces(the_mesh.advertFeat1(s_pces->server));
     return;
@@ -281,7 +310,19 @@ void pcesPickServerCb(lv_event_t* e) {
   memcpy(s_pces->server, c.id.pub_key, PUB_KEY_SIZE);
   s_pces->have_server = true;
   s_pces->server_marked = PP::answersPces(the_mesh.advertFeat1(c.id.pub_key));
-  s_pces->msg[0] = 0;
+  pcesSaveServer(c.id.pub_key);
+  pcesSay(SET_TONE_OK, "%s", TR("PCES server saved."));
+  pcesRender();
+}
+
+void pcesForgetServerCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED || !s_pces) return;
+  pcesSaveServer(nullptr);
+  s_pces->have_server = false;
+  s_pces->have_info = false;
+  pcesFindServer();   // back to whichever contact advertises PCES, if any
+  pcesSay(SET_TONE_INFO, "%s", s_pces->have_server ? TR("Saved server cleared. Using the one that advertises PCES.")
+                                                   : TR("Saved server cleared."));
   pcesRender();
 }
 
@@ -494,18 +535,24 @@ void pcesRender() {
   // Server.
   lv_obj_t* sc = setCardIn(s_pces_page, TR("PCES server"));
   ContactInfo* srv = pcesServer();
+  if (!srv && s_pces->server_saved) {
+    setNote(sc, "The saved PCES server is not in your contacts. It is used again once its advert is heard, or clear it.", SET_TONE_WARN);
+    setButton(sc, UI_ICON_TRASH_2, "Clear saved server", pcesForgetServerCb, nullptr, SET_DANGER);
+  }
   if (srv) {
     snprintf(buf, sizeof buf, "%s%s", contactShownName(srv->id.pub_key, srv->name),
              s_pces->server_marked ? "" : TR(" (no PCES marker)"));
     setInfoRow(sc, TR("Server"), buf);
+    setInfoRow(sc, TR("Chosen"), s_pces->server_saved ? TR("Saved by you") : TR("Advertises PCES"));
     setButton(sc, UI_ICON_INFO, "Server info", pcesInfoCb);
+    if (s_pces->server_saved) setButton(sc, UI_ICON_TRASH_2, "Clear saved server", pcesForgetServerCb, nullptr, SET_DANGER);
     if (s_pces->have_info) {
       const PP::InfoAnswer& i = s_pces->info;
       snprintf(buf, sizeof buf, TR("%u links over %u h, newest %u min old, SF%u"),
                (unsigned)i.links, (unsigned)i.window_h, (unsigned)i.newest_min, (unsigned)i.sf);
       pcesText(sc, buf, &g_font_12, COLOR_SUB);
     }
-  } else {
+  } else if (!s_pces->server_saved) {
     setNote(sc, "No contact advertises PCES. Pick the Commsol station (or a room it hosts):");
   }
   // Other candidates: every repeater and room (the marker is optional), capped.
@@ -545,6 +592,7 @@ static void pcesServiceEnsure() {
   if (s_pces_timer || !g_lv.task) return;
   if (!s_pces) s_pces = (PcesState*)psAlloc(sizeof(PcesState));
   if (!s_pces) return;
+  pcesLoadSaved();
   s_pces_timer = lv_timer_create(pcesTimerCb, 250, nullptr);
 }
 

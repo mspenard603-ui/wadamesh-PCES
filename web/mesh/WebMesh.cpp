@@ -261,6 +261,12 @@ bool MyMesh::uiSetContactPath(const uint8_t pub_key[32], const uint8_t* path, ui
   slot->out_path_len = (uint8_t)(((hash_sz - 1) << 6) | hops);
   return true;
 }
+uint16_t MyMesh::advertFeat1(const uint8_t pub_key[32]) {
+  const char* e = getenv("WADA_DEMO_PCES");
+  if (!e || e[0] != '1') return 0;
+  ContactInfo* c = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
+  return (c && strcmp(c->name, "Hilltop Repeater") == 0) ? 0xC502 : 0;
+}
 bool MyMesh::takePcesAdvert(uint8_t pub[32], uint8_t hop[3], uint8_t* width, uint8_t* hops) {
   static bool fired = false;
   const char* e = getenv("WADA_DEMO_PCES_ADVERT");

@@ -112,6 +112,9 @@ bool touchPrefsSetWebTerminal(bool on);
  *  with len 0 clears it. */
 size_t touchPrefsGetWebTrust(void* out, size_t cap);
 bool touchPrefsSetWebTrust(const void* buf, size_t len);
+// PCES: the server the user picked (32-byte public key); false = none saved.
+bool touchPrefsGetPcesServer(uint8_t out[32]);
+bool touchPrefsSetPcesServer(const uint8_t* pub32);   // null = forget
 
 /** UI language index (UiLang enum in i18n.h; 0 = English). Read at boot. */
 uint8_t touchPrefsGetUiLang();
