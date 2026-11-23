@@ -18,7 +18,7 @@ Lua SDK is unchanged.
 | App drawer: **PCES** tile | The PCES page. Choose a target, then tap **Find Best Route**. |
 | Contact action sheet: **PCES route** | The same page, with that contact already the target. |
 | Contacts: **PCES** badge | Repeaters and rooms advertising PCES (feature 1 `0xC5xx`, bit 1). |
-| Contacts: **PCES accepted** badge (filled) | Contacts whose stored route is the one PCES installed. It goes when MeshCore learns a different path, or on Restore / Reset path. |
+| Contacts: **PCES Score** badge (filled) | Contacts whose stored route is the one PCES installed. It goes when MeshCore learns a different path, or on Restore / Reset path. |
 | Contacts filter: **PCES servers** | Only those. |
 | In the background | Asks a PCES server for the best path to itself when its advert arrives (see below). |
 
@@ -57,7 +57,7 @@ reported.
 
 A route PCES installs is **pinned** until you **Restore** it, or until **Reset path**
 on the contact. A pin holds a fingerprint of the route it was given, so it lapses (and
-the **PCES accepted** badge goes) once MeshCore stores a different path:
+the **PCES Score** badge goes) once MeshCore stores a different path:
 
 - **Ping** sends along it. If no reply comes, it reports "No reply" instead of the
   usual fallback, which erases the stored route and floods a login to learn a new
