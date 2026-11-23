@@ -218,7 +218,7 @@ public:
     for (uint8_t i = 0; i < n && i < MAX_PATH_SIZE; ++i) h = (h ^ c.out_path[i]) * 16777619u;
     return h ? h : 1;
   }
-  void uiPinRoute(const uint8_t pub_key[32], bool pin) {
+  void uiPinRoute(const uint8_t pub_key[32], bool pin, uint8_t metric = 0) {
     uint32_t pfx; memcpy(&pfx, pub_key, 4); if (!pfx) pfx = 1;
     int slot = -1;
     for (int i = 0; i < 16; ++i) if (_pinned[i] == pfx) slot = i;
@@ -227,7 +227,15 @@ public:
     if (!c) return;
     for (int i = 0; slot < 0 && i < 16; ++i) if (!_pinned[i]) slot = i;
     if (slot < 0) slot = 15;
-    _pinned[slot] = pfx; _pinned_fp[slot] = routeFingerprint(*c);
+    _pinned[slot] = pfx; _pinned_fp[slot] = routeFingerprint(*c); _pinned_metric[slot] = metric;
+  }
+  int uiPinnedMetric(const uint8_t pub_key[32]) {
+    uint32_t pfx; memcpy(&pfx, pub_key, 4); if (!pfx) pfx = 1;
+    for (int i = 0; i < 16; ++i) if (_pinned[i] == pfx) {
+      ContactInfo* c = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
+      return (c && routeFingerprint(*c) == _pinned_fp[i]) ? _pinned_metric[i] : -1;
+    }
+    return -1;
   }
   bool uiRoutePinned(const uint8_t pub_key[32]) {
     uint32_t pfx; memcpy(&pfx, pub_key, 4); if (!pfx) pfx = 1;
@@ -238,6 +246,7 @@ public:
     return false;
   }
   uint32_t _pinned[16] = {0}, _pinned_fp[16] = {0};
+  uint8_t  _pinned_metric[16] = {0};
   int uiSendAdminCommand(ContactInfo& recipient, const char* text);         // backend CLI line
   int uiRoomRelogin(const uint8_t pub_key[32]);
   int sendRegionsRequestForUI(const uint8_t pub_key[PUB_KEY_SIZE], uint32_t& est_timeout);

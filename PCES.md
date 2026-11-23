@@ -18,7 +18,7 @@ Lua SDK is unchanged.
 | App drawer: **PCES** tile | The PCES page. Choose a target, then tap **Find Best Route**. |
 | Contact action sheet: **PCES route** | The same page, with that contact already the target. |
 | Contacts: **PCES** badge | Repeaters and rooms advertising PCES (feature 1 `0xC5xx`, bit 1). |
-| Contacts: **PCES Score** badge (filled) | Contacts whose stored route is the one PCES installed. It goes when MeshCore learns a different path, or on Restore / Reset path. |
+| Contacts: **PCES 72** badge (filled; the accepted route's score) | Contacts whose stored route is the one PCES installed. It goes when MeshCore learns a different path, or on Restore / Reset path. |
 | Contacts filter: **PCES servers** | Only those. |
 | In the background | Asks a PCES server for the best path to itself when its advert arrives (see below). |
 
@@ -53,11 +53,26 @@ room target turns the trace itself. A companion doesn't relay traces, so its tra
 turns at its last relay. There is one trace every 15 s, and no reply within 20 s is
 reported.
 
+### Default route vs PCES route
+
+**Compare routes** (on the page, once PCES has an answer or an installed route for the
+target) measures both on air, the same way:
+- **Default** is the route MeshCore had before PCES replaced it, or the stored route
+  when the answer isn't installed.
+- **PCES** is the PCES route.
+
+It sends traces out along each and back, alternating, 2 each, 15 s apart. Each route
+shows how many traces came back, the average round trip, and the weakest hop's SNR
+(every hop's reading, out and back). A verdict follows: deliveries first, then the
+weakest hop (a 2 dB or larger difference), else "about even". Nothing is installed or
+changed. A default that floods has no fixed route to trace, so only the PCES route is
+traced.
+
 ### PCES routes are pinned
 
 A route PCES installs is **pinned** until you **Restore** it, or until **Reset path**
 on the contact. A pin holds a fingerprint of the route it was given, so it lapses (and
-the **PCES Score** badge goes) once MeshCore stores a different path:
+the score badge goes) once MeshCore stores a different path:
 
 - **Ping** sends along it. If no reply comes, it reports "No reply" instead of the
   usual fallback, which erases the stored route and floods a login to learn a new

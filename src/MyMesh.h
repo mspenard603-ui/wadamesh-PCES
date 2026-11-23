@@ -1226,7 +1226,7 @@ public:
     for (uint8_t i = 0; i < n && i < MAX_PATH_SIZE; ++i) h = (h ^ c.out_path[i]) * 16777619u;
     return h ? h : 1;
   }
-  void uiPinRoute(const uint8_t pub_key[PUB_KEY_SIZE], bool pin) {
+  void uiPinRoute(const uint8_t pub_key[PUB_KEY_SIZE], bool pin, uint8_t metric = 0) {
     uint32_t pfx; memcpy(&pfx, pub_key, 4);
     if (!pfx) pfx = 1;
     int slot = -1, free_i = -1;
@@ -1234,17 +1234,30 @@ public:
       if (_pinned[i] == pfx) { slot = i; break; }
       if (!_pinned[i] && free_i < 0) free_i = i;
     }
-    if (!pin) { if (slot >= 0) _pinned[slot] = _pinned_fp[slot] = 0; return; }
+    if (!pin) { if (slot >= 0) { _pinned[slot] = _pinned_fp[slot] = 0; _pinned_metric[slot] = 0; } return; }
     ContactInfo* c = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
     if (!c) return;
     if (slot < 0) slot = free_i;
     if (slot < 0) {   // full: drop the oldest
       memmove(&_pinned[0], &_pinned[1], sizeof(_pinned[0]) * (kPinnedMax - 1));
       memmove(&_pinned_fp[0], &_pinned_fp[1], sizeof(_pinned_fp[0]) * (kPinnedMax - 1));
+      memmove(&_pinned_metric[0], &_pinned_metric[1], sizeof(_pinned_metric[0]) * (kPinnedMax - 1));
       slot = kPinnedMax - 1;
     }
     _pinned[slot] = pfx;
     _pinned_fp[slot] = routeFingerprint(*c);
+    _pinned_metric[slot] = metric;
+  }
+  /** The PCES score (0..100) of the contact's route while it is still the pinned one, else -1. */
+  int uiPinnedMetric(const uint8_t pub_key[PUB_KEY_SIZE]) {
+    uint32_t pfx; memcpy(&pfx, pub_key, 4);
+    if (!pfx) pfx = 1;
+    for (int i = 0; i < kPinnedMax; ++i) {
+      if (_pinned[i] != pfx) continue;
+      ContactInfo* c = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
+      return (c && routeFingerprint(*c) == _pinned_fp[i]) ? _pinned_metric[i] : -1;
+    }
+    return -1;
   }
   /** True while the contact's stored route is still the one PCES pinned. */
   bool uiRoutePinned(const uint8_t pub_key[PUB_KEY_SIZE]) {
@@ -1741,6 +1754,7 @@ private:
   static const int kPinnedMax = 16;
   uint32_t _pinned[kPinnedMax] = {0};   // uiPinRoute: 4-byte key prefixes, 0 = free
   uint32_t _pinned_fp[kPinnedMax] = {0};   // the pinned route's fingerprint
+  uint8_t  _pinned_metric[kPinnedMax] = {0};   // its PCES score, for the contact badge
   // takePcesAdvert slot.
   bool     _pces_adv_pending = false;
   uint8_t  _pces_adv_pub[PUB_KEY_SIZE] = {0};

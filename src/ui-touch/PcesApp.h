@@ -60,6 +60,7 @@ static constexpr int      kPcesLogMax       = 10;
 static constexpr int      kPcesAcceptedMax  = 8;
 static constexpr uint32_t kPcesTraceWaitMs  = 20000;   // out and back along the route
 static constexpr uint32_t kPcesTraceGapMs   = 15000;   // every hop answers: same floor as a Lua ping
+static constexpr uint8_t  kPcesCmpRounds    = 2;       // traces per route in a comparison
 
 enum PcesRun : uint8_t { PRUN_NONE = 0, PRUN_TEST, PRUN_INFO, PRUN_AUTO };
 // What the run waits for / does next.
@@ -75,7 +76,11 @@ struct PcesAccepted {
   char     route_txt[48];
   uint8_t  metric;
   bool     backed;                       // passed step 4 (else "Use anyway")
+  uint8_t  new_len;                      // the route PCES installed (raw out_path_len)
+  uint8_t  new_path[MAX_PATH_SIZE];
 };
+// "Compare routes": the default route vs the PCES route, by traces along each.
+struct PcesCmpSide { uint8_t len; uint8_t path[MAX_PATH_SIZE]; uint8_t sent, back; uint32_t rtt_sum; int8_t weakest4; };
 
 struct PcesState {
   bool     open;
@@ -125,6 +130,12 @@ struct PcesState {
   // The page is rebuilt on every update: keep where the user had scrolled to.
   lv_coord_t keep_scroll;
   uint8_t  rendered_view;
+  // Compare routes.
+  bool     cmp_active, cmp_done, cmp_waiting;
+  uint8_t  cmp_i;                        // traces sent so far (even: default, odd: PCES)
+  uint32_t cmp_next_at;
+  uint8_t  cmp_for[PUB_KEY_SIZE];
+  PcesCmpSide cmp[2];                    // 0 = default, 1 = PCES
 };
 PcesState* s_pces = nullptr;   // psAlloc: zero-initialised
 lv_obj_t*  s_pces_root = nullptr;
@@ -135,6 +146,7 @@ char       s_pces_title[48] = "";
 void pcesRender();   // fwd
 void pcesBack();     // fwd
 void pcesInstall(bool backed);   // fwd
+void pcesCompareTick(uint32_t now);   // fwd
 
 // ---- small helpers -------------------------------------------------------------------------
 void pcesLog(uint8_t tone, const char* fmt, ...) {
@@ -446,8 +458,10 @@ void pcesInstall(bool backed) {
   slot->metric = s_pces->ans.metric;
   slot->backed = backed;
   if (the_mesh.uiSetContactPath(t->id.pub_key, s_pces->route, (uint8_t)s_pces->route_hops, s_pces->plan.width)) {
-    the_mesh.uiPinRoute(t->id.pub_key, true);   // a failed Ping or a login must not wipe it
-    contactsListMarkStale();                    // the "PCES Score" badge
+    slot->new_len = t->out_path_len;
+    memcpy(slot->new_path, t->out_path, sizeof slot->new_path);
+    the_mesh.uiPinRoute(t->id.pub_key, true, s_pces->ans.metric);   // a failed Ping or a login must not wipe it
+    contactsListMarkStale();                    // the "PCES <score>" badge
     pcesLog(SET_TONE_OK, "%s", backed ? TR("4. Accepted and installed (unverified until used). Restore puts the old route back.")
                                       : TR("Installed anyway (unverified). Restore puts the old route back."));
   } else {
@@ -621,51 +635,147 @@ void pcesTimerCb(lv_timer_t*) {
   }
   if (s_pces->trace_tag && (uint32_t)(now - s_pces->trace_ms) >= kPcesTraceWaitMs) {
     s_pces->trace_tag = 0;
-    pcesLog(SET_TONE_WARN, "%s", TR("Trace: no reply in 20 s. A hop on this route may not be reachable."));
+    if (s_pces->cmp_waiting) { s_pces->cmp_waiting = false; s_pces->dirty = true; }   // not back
+    else pcesLog(SET_TONE_WARN, "%s", TR("Trace: no reply in 20 s. A hop on this route may not be reachable."));
   }
+  pcesCompareTick(now);
   if (s_pces->run == PRUN_NONE) pcesAutoTick();
   if (s_pces->dirty) { s_pces->dirty = false; if (s_pces->open) pcesRender(); }
 }
 
 // ---- trace route -----------------------------------------------------------------------------
-// A repeater / room target: out along its route, through it, and back. A companion never
-// relays a trace, so its trace turns at its last relay.
+// A TRACE out along `path` (raw out_path_len `len`) to contact `t` and back. A repeater /
+// room turns the trace itself; a companion never relays a trace, so its trace turns at the
+// route's last relay. Returns the tag (0 = not sent); `why` says why not.
+uint32_t pcesTraceAlong(const ContactInfo& t, uint8_t len, const uint8_t* path, const char** why) {
+  ContactInfo turn = t;
+  turn.out_path_len = len;
+  memcpy(turn.out_path, path, sizeof turn.out_path);
+  const bool has = len != OUT_PATH_UNKNOWN && mesh::Packet::isValidPathLen(len);
+  const uint8_t hops = has ? (uint8_t)(len & 63) : 0;
+  if (!pcesIsRelay(t)) {
+    if (hops == 0) { *why = TR("no route through relays to trace"); return 0; }
+    const uint8_t w = (uint8_t)((len >> 6) + 1);
+    memset(turn.id.pub_key, 0, PUB_KEY_SIZE);
+    memcpy(turn.id.pub_key, path + (size_t)(hops - 1) * w, w);
+    turn.out_path_len = (uint8_t)(((w - 1) << 6) | (hops - 1));
+  } else if (!has) {
+    *why = TR("it floods: no fixed route to trace");
+    return 0;
+  }
+  const uint32_t tag = the_mesh.uiSendTraceRoute(turn);
+  if (!tag) *why = TR("radio busy or route too long");
+  return tag;
+}
+bool pcesTraceBusy() { return s_pces->trace_tag || s_ui_ping_deadline_ms != 0; }
+
 void pcesTraceCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED || !s_pces) return;
   ContactInfo* t = pcesTarget();
   if (!t) return;
   const uint32_t now = millis();
-  if (s_pces->trace_tag || s_ui_ping_deadline_ms != 0) { pcesLog(SET_TONE_WARN, "%s", TR("A trace or ping is already waiting.")); pcesRender(); return; }
+  if (pcesTraceBusy() || s_pces->cmp_active) { pcesLog(SET_TONE_WARN, "%s", TR("A trace or ping is already waiting.")); pcesRender(); return; }
   if (s_pces->trace_last_ms && (uint32_t)(now - s_pces->trace_last_ms) < kPcesTraceGapMs) {
     pcesLog(SET_TONE_WARN, TR("Wait %u s: every hop answers a trace."), (unsigned)((kPcesTraceGapMs - (now - s_pces->trace_last_ms) + 999) / 1000));
     pcesRender(); return;
   }
-  uint32_t tag = 0;
-  char rt[64];
-  if (pcesIsRelay(*t)) {
-    tag = the_mesh.uiSendTraceRoute(*t);
-    pcesFmtContactRoute(*t, rt, sizeof rt);
-  } else {
-    const uint8_t hops = pcesHasPath(*t) ? (uint8_t)(t->out_path_len & 63) : 0;
-    if (hops == 0) { pcesLog(SET_TONE_WARN, "%s", TR("No route through relays to trace.")); pcesRender(); return; }
-    const uint8_t w = (uint8_t)((t->out_path_len >> 6) + 1);
-    ContactInfo turn = *t;   // the last relay as the turning point, the hops before it as its route
-    memset(turn.id.pub_key, 0, PUB_KEY_SIZE);
-    memcpy(turn.id.pub_key, t->out_path + (size_t)(hops - 1) * w, w);
-    turn.out_path_len = (uint8_t)(((w - 1) << 6) | (hops - 1));
-    tag = the_mesh.uiSendTraceRoute(turn);
-    pcesFmtRoute(t->out_path, hops, w, rt, sizeof rt);
-  }
-  if (!tag) { pcesLog(SET_TONE_DANGER, "%s", TR("Trace not sent: radio busy or route too long.")); pcesRender(); return; }
+  const char* why = nullptr;
+  const uint32_t tag = pcesTraceAlong(*t, t->out_path_len, t->out_path, &why);
+  if (!tag) { pcesLog(SET_TONE_WARN, TR("Trace not sent: %s."), why); pcesRender(); return; }
+  char rt[64]; pcesFmtContactRoute(*t, rt, sizeof rt);
   s_pces->trace_tag = tag; s_pces->trace_ms = now; s_pces->trace_last_ms = now;
   pcesLog(SET_TONE_INFO, TR("Trace: out along %s and back..."), rt);
   pcesRender();
 }
+
+// ---- compare routes: the default route vs the PCES route -------------------------------
+// Traces along each, alternating (default first), kPcesCmpRounds each, 15 s apart. Same
+// test both ways: delivered or not, round trip, weakest hop SNR (every hop's reading,
+// out and back). Nothing is installed or changed.
+const PcesAccepted* pcesAcceptedFor(const uint8_t* pub) {
+  for (const auto& a : s_pces->accepted) if (a.used && memcmp(a.pub, pub, PUB_KEY_SIZE) == 0) return &a;
+  return nullptr;
+}
+// The two routes for a target: (default, PCES). From the accepted list when PCES
+// installed a route; else the stored route vs the last answer for this target.
+bool pcesCmpRoutes(const ContactInfo& t, uint8_t* dlen, uint8_t* dpath, uint8_t* plen, uint8_t* ppath) {
+  if (const PcesAccepted* a = pcesAcceptedFor(t.id.pub_key)) {
+    *dlen = a->old_len; memcpy(dpath, a->old_path, MAX_PATH_SIZE);
+    *plen = a->new_len; memcpy(ppath, a->new_path, MAX_PATH_SIZE);
+    return true;
+  }
+  if (s_pces->have_answer && s_pces->route_hops >= 0 && memcmp(s_pces->answer_for, t.id.pub_key, PUB_KEY_SIZE) == 0) {
+    *dlen = t.out_path_len; memcpy(dpath, t.out_path, MAX_PATH_SIZE);
+    *plen = (uint8_t)(((s_pces->plan.width - 1) << 6) | s_pces->route_hops);
+    memset(ppath, 0, MAX_PATH_SIZE);
+    memcpy(ppath, s_pces->route, (size_t)s_pces->route_hops * s_pces->plan.width);
+    return true;
+  }
+  return false;
+}
+void pcesCompareCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED || !s_pces) return;
+  ContactInfo* t = pcesTarget();
+  if (!t || s_pces->cmp_active || s_pces->run != PRUN_NONE) return;
+  auto& d = s_pces->cmp[0]; auto& p = s_pces->cmp[1];
+  memset(s_pces->cmp, 0, sizeof s_pces->cmp);
+  if (!pcesCmpRoutes(*t, &d.len, d.path, &p.len, p.path)) return;
+  d.weakest4 = p.weakest4 = 127;
+  memcpy(s_pces->cmp_for, t->id.pub_key, PUB_KEY_SIZE);
+  s_pces->cmp_active = true; s_pces->cmp_done = false; s_pces->cmp_waiting = false;
+  s_pces->cmp_i = 0;
+  const uint32_t floor_at = s_pces->trace_last_ms ? s_pces->trace_last_ms + kPcesTraceGapMs : millis();
+  s_pces->cmp_next_at = (int32_t)(floor_at - millis()) > 0 ? floor_at : millis();
+  pcesRender();
+}
+void pcesCompareStopCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED || !s_pces) return;
+  s_pces->cmp_active = false; s_pces->cmp_waiting = false; s_pces->trace_tag = 0;
+  s_pces->cmp_done = true;
+  pcesRender();
+}
+// One step of a comparison, from the service tick.
+void pcesCompareTick(uint32_t now) {
+  if (!s_pces->cmp_active || s_pces->cmp_waiting) return;
+  if (s_pces->cmp_i >= 2 * kPcesCmpRounds) { s_pces->cmp_active = false; s_pces->cmp_done = true; s_pces->dirty = true; return; }
+  if ((int32_t)(now - s_pces->cmp_next_at) < 0 || pcesTraceBusy()) return;
+  ContactInfo* t = the_mesh.lookupContactByPubKey(s_pces->cmp_for, PUB_KEY_SIZE);
+  if (!t) { s_pces->cmp_active = false; s_pces->cmp_done = true; s_pces->dirty = true; return; }
+  PcesCmpSide& side = s_pces->cmp[s_pces->cmp_i & 1];
+  // A flooding default has no fixed route to trace: skip its turns, not counted.
+  if ((s_pces->cmp_i & 1) == 0 && (side.len == OUT_PATH_UNKNOWN || !mesh::Packet::isValidPathLen(side.len))) {
+    ++s_pces->cmp_i;
+    s_pces->dirty = true;
+    return;
+  }
+  const char* why = nullptr;
+  const uint32_t tag = pcesTraceAlong(*t, side.len, side.path, &why);
+  ++s_pces->cmp_i;
+  s_pces->cmp_next_at = now + kPcesTraceGapMs;
+  if (!tag) { side.sent++; s_pces->dirty = true; return; }   // counts as not back (e.g. a flood default)
+  side.sent++;
+  s_pces->trace_tag = tag; s_pces->trace_ms = now; s_pces->trace_last_ms = now;
+  s_pces->cmp_waiting = true;
+  s_pces->dirty = true;
+}
+
 bool pcesOnTraceResult(uint32_t tag, int8_t their_snr, int8_t our_snr, uint8_t extra_hops, const int8_t* extra) {
   if (!s_pces || !tag || tag != s_pces->trace_tag) return false;
   s_pces->trace_tag = 0;
+  const uint32_t rtt = millis() - s_pces->trace_ms;
+  if (s_pces->cmp_waiting) {   // a comparison trace: just record it
+    PcesCmpSide& side = s_pces->cmp[(s_pces->cmp_i - 1) & 1];
+    side.back++;
+    side.rtt_sum += rtt;
+    int8_t w = their_snr < our_snr ? their_snr : our_snr;
+    for (int i = 0; i < extra_hops && extra; ++i) if (extra[i] < w) w = extra[i];
+    if (w < side.weakest4) side.weakest4 = w;
+    s_pces->cmp_waiting = false;
+    s_pces->dirty = true;
+    return true;
+  }
   char line[96], v[12];
-  size_t o = snprintf(line, sizeof line, TR("Trace back in %u ms. SNR per hop:"), (unsigned)(millis() - s_pces->trace_ms));
+  size_t o = snprintf(line, sizeof line, TR("Trace back in %u ms. SNR per hop:"), (unsigned)rtt);
   pcesFmtSnr(their_snr, v, sizeof v);
   o += snprintf(line + o, sizeof line - o, " %s", v);
   for (int i = 0; i < extra_hops && extra && o < sizeof line; ++i) {
@@ -889,6 +999,60 @@ void pcesRenderMain() {
     setInfoRow(ac, TR("Weakest leg"), buf);
     pcesFmtRoute(a.hop, a.hops, a.width, buf, sizeof buf);
     setInfoRow(ac, TR("PCES path"), buf);
+  }
+
+  // Compare: the default route vs the PCES route.
+  if (t) {
+    uint8_t dl, dp[MAX_PATH_SIZE], pl, pp[MAX_PATH_SIZE];
+    const bool can = pcesCmpRoutes(*t, &dl, dp, &pl, pp);
+    const bool mine = memcmp(s_pces->cmp_for, t->id.pub_key, PUB_KEY_SIZE) == 0;
+    if (can || (mine && (s_pces->cmp_active || s_pces->cmp_done))) {
+      lv_obj_t* cc = setCardIn(s_pces_page, TR("Default route vs PCES route"));
+      const char* names[2] = { TR("Default"), TR("PCES") };
+      for (int k = 0; k < 2; ++k) {
+        char rt[64];
+        const uint8_t len = (mine && (s_pces->cmp_active || s_pces->cmp_done)) ? s_pces->cmp[k].len : (k ? pl : dl);
+        const uint8_t* path = (mine && (s_pces->cmp_active || s_pces->cmp_done)) ? s_pces->cmp[k].path : (k ? pp : dp);
+        if (len == OUT_PATH_UNKNOWN || !mesh::Packet::isValidPathLen(len)) pcesFmtRoute(nullptr, -1, 1, rt, sizeof rt);
+        else pcesFmtRoute(path, len & 63, (len >> 6) + 1, rt, sizeof rt);
+        setInfoRow(cc, names[k], rt);
+      }
+      if (mine && (s_pces->cmp_active || s_pces->cmp_done)) {
+        for (int k = 0; k < 2; ++k) {
+          const PcesCmpSide& c = s_pces->cmp[k];
+          char w[16];
+          if (c.back) pcesFmtSnr(c.weakest4, w, sizeof w); else snprintf(w, sizeof w, "-");
+          snprintf(buf, sizeof buf, TR("%s: %u/%u traces back, avg %u ms, weakest hop %s"), names[k],
+                   (unsigned)c.back, (unsigned)c.sent, c.back ? (unsigned)(c.rtt_sum / c.back) : 0u, w);
+          pcesText(cc, buf, &g_font_12, COLOR_TEXT);
+        }
+        if (s_pces->cmp_active) {
+          snprintf(buf, sizeof buf, TR("Tracing %u of %u (one every 15 s)..."),
+                   (unsigned)s_pces->cmp_i, (unsigned)(2 * kPcesCmpRounds));
+          pcesText(cc, buf, &g_font_12, COLOR_STATUS_INFO);
+          setButton(cc, UI_ICON_X, "Stop comparing", pcesCompareStopCb, nullptr, SET_DANGER);
+        } else {
+          // The verdict: deliveries first, then the weakest hop, then the round trip.
+          const PcesCmpSide& d = s_pces->cmp[0]; const PcesCmpSide& q = s_pces->cmp[1];
+          const char* v;
+          const bool d_floods = d.len == OUT_PATH_UNKNOWN || !mesh::Packet::isValidPathLen(d.len);
+          if (d_floods) v = q.back ? TR("The default floods, so only the PCES route could be traced: it delivered.")
+                                   : TR("The default floods, so only the PCES route could be traced: no trace came back.");
+          else if (q.back != d.back) v = q.back > d.back ? TR("PCES route delivered more traces.") : TR("Default route delivered more traces.");
+          else if (!q.back) v = TR("Neither route brought a trace back.");
+          else if (q.weakest4 - d.weakest4 >= 8) v = TR("PCES route: stronger weakest hop (2 dB or more).");
+          else if (d.weakest4 - q.weakest4 >= 8) v = TR("Default route: stronger weakest hop (2 dB or more).");
+          else v = TR("About even: weakest hops within 2 dB.");
+          pcesText(cc, v, &g_font_semi_14, COLOR_STATUS_OK);
+          setButton(cc, UI_ICON_ACTIVITY, "Compare again", pcesCompareCb);
+        }
+      } else {
+        setButton(cc, UI_ICON_ACTIVITY, "Compare routes", pcesCompareCb, nullptr,
+                  (s_pces->run == PRUN_NONE && !pcesTraceBusy()) ? SET_NORMAL : SET_NORMAL);
+        setNote(cc, "Traces out along each route and back, alternating, 2 each, 15 s apart: how many come back, "
+                    "the round trip, and the weakest hop's SNR. Nothing is changed.");
+      }
+    }
   }
 
   // Server.
