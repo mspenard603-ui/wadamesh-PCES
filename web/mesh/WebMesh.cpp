@@ -252,6 +252,15 @@ bool MyMesh::uiResetContactPath(const uint8_t pub_key[32]) {
   if (_backend) _backend->contactPathReset(pub_key);
   return true;
 }
+bool MyMesh::uiSetContactPath(const uint8_t pub_key[32], const uint8_t* path, uint8_t hops, uint8_t hash_sz) {
+  if (hash_sz < 1 || hash_sz > 3 || hops > 63 || (unsigned)hops * hash_sz > MAX_PATH_SIZE) return false;
+  ContactInfo* slot = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
+  if (!slot) return false;
+  memset(slot->out_path, 0, sizeof(slot->out_path));
+  if (hops && path) memcpy(slot->out_path, path, (size_t)hops * hash_sz);
+  slot->out_path_len = (uint8_t)(((hash_sz - 1) << 6) | hops);
+  return true;
+}
 bool MyMesh::uiShareContact(const uint8_t pub_key[32]) {
   if (!_backend || !lookupContactByPubKey(pub_key, PUB_KEY_SIZE)) return false;
   return _backend->shareContact(pub_key);

@@ -72,6 +72,7 @@ extern bool             luaHostSdClearAttributes(const char* path); // drop read
 #include "SdThreat.h"   // the SD malware policy wada.sd.check/remove enforce
 #endif
 extern int  luaHostContactFlags(int idx);   // ContactInfo.flags, bit 0 = favourite
+extern int  luaHostContactFeat1(int idx);   // advert feature-1 word, 0 = none (Commsol: 0xC5xx)
 extern void luaHostLockScreen();
 extern int  luaHostContactAt(int idx, char* name, size_t name_cap, int* type, uint32_t* secs_ago,
                              double* lat, double* lon, char* pk_hex, size_t pk_cap,
@@ -142,6 +143,21 @@ extern void  luaHostMapClearOverlay(void* v);
 extern int   luaHostMapMarker(void* v, double lat, double lon, uint32_t color, int size);
 extern int   luaHostMapLine(void* v, double la1, double lo1, double la2, double lo2,
                             uint32_t color, int width);
+extern int      luaHostReqPerm(const char* app_id);
+extern void     luaHostRequestReqPerm(const char* app_id, const char* app_name);
+extern int      luaHostRoutePerm(const char* app_id);
+extern void     luaHostRequestRoutePerm(const char* app_id, const char* app_name);
+extern uint32_t luaHostMeshLogin(const char* who, const char* password, const char** err);
+extern int      luaHostLoginTake(bool* ok, int* perms, char* pk_hex, size_t pk_cap);
+extern void     luaHostLoginCancel(char* pk_hex, size_t pk_cap);
+extern uint32_t luaHostMeshRequest(const char* who, const uint8_t* data, size_t len, const char** err,
+                                   char* pk_hex, size_t pk_cap);
+extern int      luaHostRequestTake(uint8_t* out, size_t cap);
+extern void     luaHostRequestCancel();
+extern int      luaHostContactRoute(const char* who, uint8_t* path, int* hops, int* hash_sz);
+extern bool     luaHostSetContactRoute(const char* who, const uint8_t* path, int hops, int hash_sz,
+                                       const char** err);
+extern int      luaHostPathHashSize();
 extern int      luaHostProbePerm(const char* app_id);
 extern void     luaHostRequestProbePerm(const char* app_id, const char* app_name);
 extern uint32_t luaHostMeshDiscover(int type_filter);
@@ -1181,6 +1197,8 @@ int sysCaps(lua_State* L) {
   lua_pushboolean(L, 1);                lua_setfield(L, -2, "packets");    // app.on_packet
   lua_pushboolean(L, 1);                lua_setfield(L, -2, "paths");      // repeater hashes in packets, messages, repeats()
   lua_pushboolean(L, CAP_LUA_SDK_EXT);  lua_setfield(L, -2, "ping");       // wada.mesh.ping + app.on_ping
+  lua_pushboolean(L, CAP_LUA_SDK_EXT);  lua_setfield(L, -2, "node_requests"); // mesh.login/request/route/set_route
+  lua_pushboolean(L, 1);                lua_setfield(L, -2, "feat1");      // contacts()[i].feat1
   lua_pushboolean(L, 1);                lua_setfield(L, -2, "measure");    // ui.text_w / text_lines
   lua_pushboolean(L, CAP_SENSORS);      lua_setfield(L, -2, "sensors");    // wada.sys.env
   lua_pushboolean(L, CAP_LUA_SDK_EXT);  lua_setfield(L, -2, "map");        // wada.map.view
@@ -1822,6 +1840,207 @@ int meshPing(lua_State* L) {
   s_ping_poll = lv_timer_create(pingPollCb, 100, nullptr);
   lua_pushinteger(L, (lua_Integer)tag);
   return 1;
+}
+
+// ---- wada.mesh.login / request / route / set_route -----------------------
+//
+// What a client of a node-hosted service needs (Commsol's PCES path computation is
+// the first): log in to one repeater or room, send it a binary REQ, and act on the
+// answer by installing a route. login and request transmit, so both sit behind the
+// "requests" grant and a 12 s per-call floor (PCES servers answer 5 a minute per
+// client, and an unanswered request is never retried by the firmware). set_route
+// changes only this device's own routing table, behind the "routes" grant.
+// Replies are polled off a timer: they arrive inside packet reception.
+static constexpr uint32_t kMeshReqMinGapMs   = 12000;
+static constexpr uint32_t kMeshLoginTimeoutMs = 20000;
+static constexpr uint32_t kMeshReqTimeoutMs   = 30000;   // default; at most 40 s (the slot frees at 45)
+static lv_timer_t* s_login_poll = nullptr;
+static uint32_t    s_login_sent_ms = 0, s_login_last_ms = 0;
+static lv_timer_t* s_req_poll = nullptr;
+static uint32_t    s_req_sent_ms = 0, s_req_last_ms = 0, s_req_timeout_ms = 0;
+static char        s_req_who[12] = "";
+
+static int permGate(lua_State* L, int (*get)(const char*), void (*ask)(const char*, const char*)) {
+  const int perm = get(s_h->id);
+  if (perm == 1) return 0;
+  if (perm == 0) ask(s_h->id, s_h->title[0] ? s_h->title : s_h->id);   // ask once, never in a loop
+  lua_pushnil(L);
+  lua_pushstring(L, perm == 0 ? "permission requested" : "permission denied");
+  return 2;
+}
+
+static void loginPollCb(lv_timer_t*) {
+  if (!s_h || !s_h->L) return;
+  bool ok = false; int perms = 0; char pk[12] = "";
+  const bool got = luaHostLoginTake(&ok, &perms, pk, sizeof pk) == 1;
+  if (!got && (uint32_t)(millis() - s_login_sent_ms) < kMeshLoginTimeoutMs) return;
+  lv_timer_del(s_login_poll); s_login_poll = nullptr;
+  if (!got) luaHostLoginCancel(pk, sizeof pk);
+  if (!pushCallback(s_h, "on_login")) return;
+  lua_State* L = s_h->L;
+  lua_createtable(L, 0, 4);
+  lua_pushstring(L, pk);    lua_setfield(L, -2, "pubkey");
+  lua_pushboolean(L, got && ok); lua_setfield(L, -2, "ok");
+  if (got) { lua_pushinteger(L, perms); lua_setfield(L, -2, "perms"); }
+  if (!got) { lua_pushstring(L, "no reply"); lua_setfield(L, -2, "err"); }
+  else if (!ok) { lua_pushstring(L, "refused"); lua_setfield(L, -2, "err"); }
+  guardedCall(s_h, 1);
+  serviceDeferredClose();
+}
+
+// wada.mesh.login(who [, password]) -> true | nil, reason   (answer in app.on_login)
+int meshLogin(lua_State* L) {
+  const char* who = luaL_checkstring(L, 1);
+  const char* pw  = luaL_optstring(L, 2, "");
+  if (!s_h) { lua_pushnil(L); lua_pushstring(L, "no app"); return 2; }
+  if (int n = permGate(L, luaHostReqPerm, luaHostRequestReqPerm)) return n;
+  const uint32_t now = millis();
+  if (s_login_last_ms && (uint32_t)(now - s_login_last_ms) < kMeshReqMinGapMs) {
+    lua_pushnil(L); lua_pushstring(L, "too fast"); return 2;
+  }
+  if (s_login_poll) { lua_pushnil(L); lua_pushstring(L, "busy"); return 2; }
+  const char* err = nullptr;
+  if (!luaHostMeshLogin(who, pw, &err)) { lua_pushnil(L); lua_pushstring(L, err ? err : "radio busy"); return 2; }
+  s_login_last_ms = s_login_sent_ms = now;
+  s_login_poll = lv_timer_create(loginPollCb, 100, nullptr);
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
+static void reqPollCb(lv_timer_t*) {
+  if (!s_h || !s_h->L) return;
+  uint8_t buf[200];
+  const int n = luaHostRequestTake(buf, sizeof buf);
+  if (n < 0 && (uint32_t)(millis() - s_req_sent_ms) < s_req_timeout_ms) return;
+  lv_timer_del(s_req_poll); s_req_poll = nullptr;
+  if (n < 0) luaHostRequestCancel();
+  if (!pushCallback(s_h, "on_reply")) return;
+  lua_State* L = s_h->L;
+  lua_createtable(L, 0, 4);
+  lua_pushstring(L, s_req_who);  lua_setfield(L, -2, "pubkey");
+  lua_pushboolean(L, n >= 0);    lua_setfield(L, -2, "ok");
+  if (n >= 0) { lua_pushlstring(L, (const char*)buf, (size_t)n); lua_setfield(L, -2, "data"); }
+  else        { lua_pushstring(L, "no reply"); lua_setfield(L, -2, "err"); }
+  lua_pushinteger(L, (lua_Integer)(millis() - s_req_sent_ms)); lua_setfield(L, -2, "rtt_ms");
+  guardedCall(s_h, 1);
+  serviceDeferredClose();
+}
+
+// wada.mesh.request(who, data [, timeout_ms]) -> "direct"|"flood" | nil, reason
+// `data` is a binary string: the REQ payload, first byte the request type. The
+// answer (minus its 4-byte reflected tag) arrives in app.on_reply. Log in first:
+// a repeater or room drops a REQ from a client not on its access list.
+int meshRequest(lua_State* L) {
+  const char* who = luaL_checkstring(L, 1);
+  size_t len = 0;
+  const char* data = luaL_checklstring(L, 2, &len);
+  lua_Integer to = luaL_optinteger(L, 3, kMeshReqTimeoutMs);
+  if (to < 2000) to = 2000;
+  if (to > 40000) to = 40000;
+  if (!s_h) { lua_pushnil(L); lua_pushstring(L, "no app"); return 2; }
+  if (int n = permGate(L, luaHostReqPerm, luaHostRequestReqPerm)) return n;
+  const uint32_t now = millis();
+  if (s_req_last_ms && (uint32_t)(now - s_req_last_ms) < kMeshReqMinGapMs) {
+    lua_pushnil(L); lua_pushstring(L, "too fast"); return 2;
+  }
+  if (s_req_poll) { lua_pushnil(L); lua_pushstring(L, "busy"); return 2; }
+  const char* err = nullptr;
+  // s_req_who: the reply is reported against the 8-hex key, whatever the caller named it by.
+  const uint32_t how = luaHostMeshRequest(who, (const uint8_t*)data, len, &err, s_req_who, sizeof s_req_who);
+  if (!how) { lua_pushnil(L); lua_pushstring(L, err ? err : "radio busy"); return 2; }
+  s_req_last_ms = s_req_sent_ms = now;
+  s_req_timeout_ms = (uint32_t)to;
+  s_req_poll = lv_timer_create(reqPollCb, 100, nullptr);
+  lua_pushstring(L, how == 2 ? "flood" : "direct");
+  return 1;
+}
+
+static void pushHex(lua_State* L, const uint8_t* b, int n) {
+  static const char H[] = "0123456789abcdef";
+  char out[16];
+  for (int i = 0; i < n && i < 7; i++) { out[2 * i] = H[b[i] >> 4]; out[2 * i + 1] = H[b[i] & 15]; }
+  lua_pushlstring(L, out, (size_t)(2 * (n < 7 ? n : 7)));
+}
+
+// wada.mesh.route(who) -> {hops = {"3a7d", ...}, hash_size = 2} | false (no route:
+// messages flood) | nil, "no such contact". Ungated: it is this device's own table.
+int meshRoute(lua_State* L) {
+  const char* who = luaL_checkstring(L, 1);
+  uint8_t path[64]; int hops = 0, hsz = 1;
+  const int r = luaHostContactRoute(who, path, &hops, &hsz);
+  if (r < 0) { lua_pushnil(L); lua_pushstring(L, "no such contact"); return 2; }
+  if (r == 0) { lua_pushboolean(L, 0); return 1; }
+  lua_createtable(L, 0, 2);
+  lua_createtable(L, hops, 0);
+  for (int i = 0; i < hops; i++) { pushHex(L, &path[i * hsz], hsz); lua_rawseti(L, -2, i + 1); }
+  lua_setfield(L, -2, "hops");
+  lua_pushinteger(L, hsz); lua_setfield(L, -2, "hash_size");
+  return 1;
+}
+
+static int hexNibble(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+
+// wada.mesh.set_route(who, hops) -> true | false, reason
+// `hops` is a list of hex hop hashes, all the same width (1-3 bytes), first relay
+// first -- the shape route() returns. nil or {} is NOT "direct": nil resets the
+// contact to no route (flood and relearn); {} installs a zero-hop direct route.
+int meshSetRoute(lua_State* L) {
+  const char* who = luaL_checkstring(L, 1);
+  if (!s_h) { lua_pushboolean(L, 0); lua_pushstring(L, "no app"); return 2; }
+  {
+    const int perm = luaHostRoutePerm(s_h->id);
+    if (perm != 1) {
+      if (perm == 0) luaHostRequestRoutePerm(s_h->id, s_h->title[0] ? s_h->title : s_h->id);
+      lua_pushboolean(L, 0);
+      lua_pushstring(L, perm == 0 ? "permission requested" : "permission denied");
+      return 2;
+    }
+  }
+  const char* err = nullptr;
+  if (lua_isnoneornil(L, 2)) {
+    const bool ok = luaHostSetContactRoute(who, nullptr, 0, 1, &err);
+    lua_pushboolean(L, ok);
+    if (!ok) { lua_pushstring(L, err); return 2; }
+    return 1;
+  }
+  luaL_checktype(L, 2, LUA_TTABLE);
+  const int n = (int)lua_rawlen(L, 2);
+  if (n > 63) { lua_pushboolean(L, 0); lua_pushstring(L, "bad route"); return 2; }
+  uint8_t path[64]; int hsz = 0;
+  for (int i = 1; i <= n; i++) {
+    lua_rawgeti(L, 2, i);
+    size_t sl = 0;
+    const char* h = lua_tolstring(L, -1, &sl);
+    const int w = (int)(sl / 2);
+    const bool shape_ok = h && sl % 2 == 0 && w >= 1 && w <= 3 && (hsz == 0 || w == hsz) && i * w <= 64;
+    if (!shape_ok) { lua_pop(L, 1); lua_pushboolean(L, 0); lua_pushstring(L, "bad route"); return 2; }
+    hsz = w;
+    for (int k = 0; k < w; k++) {
+      const int hi = hexNibble(h[2 * k]), lo = hexNibble(h[2 * k + 1]);
+      if (hi < 0 || lo < 0) { lua_pop(L, 1); lua_pushboolean(L, 0); lua_pushstring(L, "bad route"); return 2; }
+      path[(i - 1) * w + k] = (uint8_t)((hi << 4) | lo);
+    }
+    lua_pop(L, 1);
+  }
+  if (hsz == 0) hsz = luaHostPathHashSize();   // zero hops: any width encodes "direct"
+  const bool ok = luaHostSetContactRoute(who, path, n, hsz, &err);
+  lua_pushboolean(L, ok);
+  if (!ok) { lua_pushstring(L, err); return 2; }
+  return 1;
+}
+
+// wada.mesh.path_hash_size() -> 1..3, bytes per hop in the floods this node sends.
+int meshPathHashSize(lua_State* L) { lua_pushinteger(L, luaHostPathHashSize()); return 1; }
+
+static void meshRequestsTeardown() {
+  if (s_login_poll) { lv_timer_del(s_login_poll); s_login_poll = nullptr; luaHostLoginCancel(nullptr, 0); }
+  if (s_req_poll)   { lv_timer_del(s_req_poll);   s_req_poll = nullptr;   luaHostRequestCancel(); }
+  s_login_last_ms = s_req_last_ms = 0;   // floors are per app session
 }
 
 // ---- wada.map: the firmware's own slippy map, inside an app --------------
@@ -2846,7 +3065,7 @@ int meshContacts(lua_State* L) {
   for (int i = (offset > 0 ? offset : 0), out = 0; out < limit; i++) {
     if (!luaHostContactAt(i, name, sizeof name, &type, &ago, &lat, &lon, pk, sizeof pk,
                           &lat6, &lon6)) break;
-    lua_createtable(L, 0, 10);
+    lua_createtable(L, 0, 11);
     lua_pushstring(L, name);          lua_setfield(L, -2, "name");
     lua_pushstring(L, pk);            lua_setfield(L, -2, "pubkey");
     lua_pushinteger(L, type);         lua_setfield(L, -2, "type");
@@ -2858,6 +3077,7 @@ int meshContacts(lua_State* L) {
     const int cflags = luaHostContactFlags(i);
     lua_pushinteger(L, cflags);       lua_setfield(L, -2, "flags");
     lua_pushboolean(L, cflags & 1);   lua_setfield(L, -2, "favorite");
+    lua_pushinteger(L, luaHostContactFeat1(i)); lua_setfield(L, -2, "feat1");
     lua_rawseti(L, -2, ++out);
   }
   return 1;
@@ -3616,6 +3836,11 @@ void openWada(lua_State* L) {
   lua_pushcfunction(L, meshSendDm);   lua_setfield(L, -2, "send_dm");   // consent-gated (DMs + rooms)
   lua_pushcfunction(L, meshChannels); lua_setfield(L, -2, "channels");  // names only, no secrets
   lua_pushcfunction(L, meshDiscover); lua_setfield(L, -2, "discover");  // consent-gated (transmits)
+  lua_pushcfunction(L, meshLogin);    lua_setfield(L, -2, "login");     // consent-gated (requests)
+  lua_pushcfunction(L, meshRequest);  lua_setfield(L, -2, "request");   // consent-gated (requests)
+  lua_pushcfunction(L, meshRoute);    lua_setfield(L, -2, "route");     // read-only
+  lua_pushcfunction(L, meshSetRoute); lua_setfield(L, -2, "set_route"); // consent-gated (routes)
+  lua_pushcfunction(L, meshPathHashSize); lua_setfield(L, -2, "path_hash_size");
 #endif
   lua_setfield(L, -2, "mesh");
 
@@ -3896,6 +4121,7 @@ void hostTeardown() {
   if (s_pkt_poll) { lv_timer_del(s_pkt_poll); s_pkt_poll = nullptr; }
 #if CAP_LUA_SDK_EXT
   if (s_ping_poll) { lv_timer_del(s_ping_poll); s_ping_poll = nullptr; s_ping_tag = 0; luaHostPingCancel(); }
+  meshRequestsTeardown();
 #endif
 #if CAP_LUA_AUDIO
   if (s_audio_poll) { lv_timer_del(s_audio_poll); s_audio_poll = nullptr; }

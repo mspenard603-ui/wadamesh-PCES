@@ -117,6 +117,13 @@ public:
   void resetPathTo(ContactInfo& recipient);
   int uiContactIdxByPubKey(const uint8_t pub_key[32]);
   bool uiResetContactPath(const uint8_t pub_key[32]);
+  // PCES / wada.mesh.set_route: the browser build edits only its mirror (the backend
+  // has no "set path" call yet); the device firmware persists it (src/MyMesh.h).
+  bool uiSetContactPath(const uint8_t pub_key[32], const uint8_t* path, uint8_t hops, uint8_t hash_sz);
+  uint16_t advertFeat1(const uint8_t pub_key[32]) { (void)pub_key; return 0; }   // not mirrored
+  static bool contactNeedsGuestLogin(const ContactInfo& c) {
+    return c.type == ADV_TYPE_REPEATER || c.type == ADV_TYPE_ROOM || c.type == ADV_TYPE_SENSOR;
+  }
   bool uiShareContact(const uint8_t pub_key[32]);       // companion: CMD_SHARE_CONTACT; demo: false
   bool uiSetContactGps(const uint8_t pub_key[32], int32_t lat_e6, int32_t lon_e6);
   bool uiAddManualContact(const uint8_t pub_key[32], const char* name);

@@ -1,0 +1,1 @@
+{"id":"pces","name":"PCES","ver":"0.1","desc":"Ask a Commsol station's path service (PCES) for the best route to a contact, see its metric and weakest-leg SNR, and install it with one tap.","icon":"signal","requires":"sdk_ext"}

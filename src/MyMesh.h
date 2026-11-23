@@ -1195,6 +1195,54 @@ public:
     return true;
   }
 
+  /** Install an explicit out path for a contact (Lua wada.mesh.set_route, used by
+   *  the PCES app to apply a route a path-computation server suggested). `hops`
+   *  relays of `hash_sz` bytes each, first hop first, packed into out_path_len the
+   *  way Packet.h does: bits 6-7 = hash size - 1, bits 0-5 = hop count. Zero hops is
+   *  a valid "direct" route. Returns false for an unknown contact or a path that does
+   *  not fit. MeshCore still falls back to a flood (and relearns a path) if this
+   *  route stops delivering, exactly as it does for a learned one. */
+  bool uiSetContactPath(const uint8_t pub_key[32], const uint8_t* path, uint8_t hops, uint8_t hash_sz) {
+    if (hash_sz < 1 || hash_sz > 3 || hops > 63) return false;
+    if ((unsigned)hops * hash_sz > MAX_PATH_SIZE) return false;
+    ContactInfo* slot = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
+    if (!slot) return false;
+    const uint8_t packed = (uint8_t)(((hash_sz - 1) << 6) | hops);
+    if (!mesh::Packet::isValidPathLen(packed)) return false;
+    memset(slot->out_path, 0, sizeof(slot->out_path));
+    if (hops && path) memcpy(slot->out_path, path, (size_t)hops * hash_sz);
+    slot->out_path_len = packed;
+    saveContacts();
+    return true;
+  }
+
+  /** The advert "feature 1" word a node last announced (ADV_FEAT1_MASK), or 0.
+   *  MeshCore parses and then drops it; Commsol uses it as a service marker
+   *  (0xC5xx = a Commsol node, bit 1 = answers PCES, bit 0 = room slash commands).
+   *  Served from a small RAM cache filled by onAdvertRecv; on a miss (adverts heard
+   *  before this boot) it is recovered from the stored raw advert blob, and that
+   *  answer is cached too so a contacts() walk reads flash at most once per node. */
+  uint16_t advertFeat1(const uint8_t pub_key[PUB_KEY_SIZE]) {
+    uint32_t pfx; memcpy(&pfx, pub_key, 4);
+    for (uint8_t i = 0; i < kFeat1Slots; ++i)
+      if (_feat1_pfx[i] == pfx && _feat1_known[i]) return _feat1_val[i];
+    uint16_t f = 0;
+    uint8_t blob[MAX_TRANS_UNIT + 1];
+    const int n = _store ? _store->getBlobByKey(pub_key, PUB_KEY_SIZE, blob) : 0;
+    if (n > 0 && n <= MAX_TRANS_UNIT) {
+      mesh::Packet pkt;
+      // An advert payload is pub_key(32) + timestamp(4) + signature(64) + app_data.
+      const int kAppDataAt = PUB_KEY_SIZE + 4 + SIGNATURE_SIZE;
+      if (pkt.readFrom(blob, (uint8_t)n) && pkt.getPayloadType() == PAYLOAD_TYPE_ADVERT &&
+          pkt.payload_len > kAppDataAt) {
+        AdvertDataParser p(&pkt.payload[kAppDataAt], (uint8_t)(pkt.payload_len - kAppDataAt));
+        f = p.getFeat1();
+      }
+    }
+    rememberFeat1(pub_key, f);
+    return f;
+  }
+
   /** Re-broadcast a contact's advert as a zero-hop packet so nodes in direct
    *  range can add it. Mirrors the CMD_SHARE_CONTACT serial handler. Zero-hop
    *  deliberately: flooding a third party's advert spends the whole mesh's
@@ -1473,6 +1521,25 @@ private:
   // already wrote, so there is no cache to keep coherent. A node that RENAMES itself keeps its
   // old shared blob until the next reboot, which is a fair price for removing the churn.
   // Cost: kBlobSeenSlots * 4 bytes of DRAM. Move to PSRAM if static DRAM ever gets tight.
+  // Capture the advert feature-1 word before the core parses it and throws it away
+  // (see advertFeat1). Everything else is BaseChatMesh's normal advert handling.
+  void onAdvertRecv(mesh::Packet* packet, const mesh::Identity& id, uint32_t timestamp,
+                    const uint8_t* app_data, size_t app_data_len) override {
+    if (app_data && app_data_len > 0) {
+      AdvertDataParser p(app_data, (uint8_t)app_data_len);
+      if (p.isValid()) rememberFeat1(id.pub_key, p.getFeat1());
+    }
+    BaseChatMesh::onAdvertRecv(packet, id, timestamp, app_data, app_data_len);
+  }
+  void rememberFeat1(const uint8_t* pub_key, uint16_t f) {
+    uint32_t pfx; memcpy(&pfx, pub_key, 4);
+    uint8_t slot = _feat1_next;
+    for (uint8_t i = 0; i < kFeat1Slots; ++i)
+      if (_feat1_known[i] && _feat1_pfx[i] == pfx) { slot = i; break; }
+    if (slot == _feat1_next) _feat1_next = (uint8_t)((_feat1_next + 1) % kFeat1Slots);
+    _feat1_pfx[slot] = pfx; _feat1_val[slot] = f; _feat1_known[slot] = true;
+  }
+
   bool putBlobByKey(const uint8_t key[], int key_len, const uint8_t src_buf[], int len) override {
     if (key_len >= 4) {
       uint32_t pfx;
@@ -1582,6 +1649,12 @@ private:
   // putBlobByKey. Sized above a full contact list so the common case never thrashes.
   static const uint16_t kBlobSeenSlots = 512;   // power of two (mask), 2 KB total
   uint32_t _blob_seen[kBlobSeenSlots] = {0};
+  // advertFeat1 cache: round-robin, 4-byte pubkey prefix -> feature-1 word (0 cached too).
+  static const uint8_t kFeat1Slots = 64;
+  uint32_t _feat1_pfx[kFeat1Slots] = {0};
+  uint16_t _feat1_val[kFeat1Slots] = {0};
+  bool     _feat1_known[kFeat1Slots] = {false};
+  uint8_t  _feat1_next = 0;
 
   TransportKey send_scope;
   TransportKey _chan_scope_saved;             // push/popChannelScope stash
