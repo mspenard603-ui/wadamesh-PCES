@@ -1217,21 +1217,44 @@ public:
    *  user restores or resets it; a request over it that gets no answer is reported as
    *  such. MeshCore's own path learning is untouched: a route that stops delivering is
    *  still replaced when a flood teaches a new one. RAM only, like PCES's Restore list. */
+  // A pin remembers the route it was given (a fingerprint of out_path_len + out_path),
+  // so it only counts while that route is still the one stored: once MeshCore learns a
+  // different path, the pin is stale and neither protects nor badges anything.
+  static uint32_t routeFingerprint(const ContactInfo& c) {
+    uint32_t h = 2166136261u ^ c.out_path_len;   // FNV-1a
+    const uint8_t n = (c.out_path_len == OUT_PATH_UNKNOWN) ? 0 : (uint8_t)((c.out_path_len & 63) * ((c.out_path_len >> 6) + 1));
+    for (uint8_t i = 0; i < n && i < MAX_PATH_SIZE; ++i) h = (h ^ c.out_path[i]) * 16777619u;
+    return h ? h : 1;
+  }
   void uiPinRoute(const uint8_t pub_key[PUB_KEY_SIZE], bool pin) {
     uint32_t pfx; memcpy(&pfx, pub_key, 4);
-    int free_i = -1;
+    if (!pfx) pfx = 1;
+    int slot = -1, free_i = -1;
     for (int i = 0; i < kPinnedMax; ++i) {
-      if (_pinned[i] == pfx) { if (!pin) _pinned[i] = 0; return; }
+      if (_pinned[i] == pfx) { slot = i; break; }
       if (!_pinned[i] && free_i < 0) free_i = i;
     }
-    if (pin) {
-      if (free_i < 0) { memmove(&_pinned[0], &_pinned[1], sizeof(_pinned[0]) * (kPinnedMax - 1)); free_i = kPinnedMax - 1; }
-      _pinned[free_i] = pfx ? pfx : 1;
+    if (!pin) { if (slot >= 0) _pinned[slot] = _pinned_fp[slot] = 0; return; }
+    ContactInfo* c = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
+    if (!c) return;
+    if (slot < 0) slot = free_i;
+    if (slot < 0) {   // full: drop the oldest
+      memmove(&_pinned[0], &_pinned[1], sizeof(_pinned[0]) * (kPinnedMax - 1));
+      memmove(&_pinned_fp[0], &_pinned_fp[1], sizeof(_pinned_fp[0]) * (kPinnedMax - 1));
+      slot = kPinnedMax - 1;
     }
+    _pinned[slot] = pfx;
+    _pinned_fp[slot] = routeFingerprint(*c);
   }
-  bool uiRoutePinned(const uint8_t pub_key[PUB_KEY_SIZE]) const {
+  /** True while the contact's stored route is still the one PCES pinned. */
+  bool uiRoutePinned(const uint8_t pub_key[PUB_KEY_SIZE]) {
     uint32_t pfx; memcpy(&pfx, pub_key, 4);
-    for (int i = 0; i < kPinnedMax; ++i) if (_pinned[i] && _pinned[i] == pfx) return true;
+    if (!pfx) pfx = 1;
+    for (int i = 0; i < kPinnedMax; ++i) {
+      if (_pinned[i] != pfx) continue;
+      ContactInfo* c = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
+      return c && routeFingerprint(*c) == _pinned_fp[i];
+    }
     return false;
   }
 
@@ -1717,6 +1740,7 @@ private:
   uint8_t  _feat1_next = 0;
   static const int kPinnedMax = 16;
   uint32_t _pinned[kPinnedMax] = {0};   // uiPinRoute: 4-byte key prefixes, 0 = free
+  uint32_t _pinned_fp[kPinnedMax] = {0};   // the pinned route's fingerprint
   // takePcesAdvert slot.
   bool     _pces_adv_pending = false;
   uint8_t  _pces_adv_pub[PUB_KEY_SIZE] = {0};

@@ -24485,6 +24485,7 @@ static void openContactActionSheet(uint32_t mesh_idx, bool is_repeater, const ch
 static bool raOverlayAboveClose();   // closes a popup opened over the app (defined by the popup registry)
 #include "RepeaterAdminApp.h"
 // PCES route screen (Commsol path service): same translation-unit arrangement.
+static void contactsListMarkStale();   // defined with the contacts list below
 #include "PcesApp.h"
 
 // Toggle a contact's favorite state. Persists in NVS via TouchPrefsStore (the
@@ -51280,17 +51281,24 @@ static void refreshContactsList() {
     char san[40];
     copyUtf8ReplacingMissingGlyphs(&g_font_semi_14, san, sizeof(san), e.name);
     const lv_coord_t name_full = lv_txt_get_width(san, strlen(san), &g_font_semi_14, 0, LV_TEXT_FLAG_NONE);
-    // PCES badge: a repeater or room advertising Commsol's path service (PcesApp.h).
-    bool is_pces = false;
-    if (is_rep || e.type == ADV_TYPE_ROOM) {
+    // PCES badges (PcesApp.h): "PCES", outlined, on a repeater or room advertising
+    // Commsol's path service; "PCES path", filled, on a contact whose stored route is
+    // the one PCES installed (it goes when MeshCore learns another, or on Restore).
+    bool is_pces = false, has_pces_path = false;
+    {
       ContactInfo pc;
-      is_pces = the_mesh.getContactByIdx(static_cast<uint32_t>(e.mesh_idx), pc) &&
-                PcesProto::answersPces(the_mesh.advertFeat1(pc.id.pub_key));
+      if (the_mesh.getContactByIdx(static_cast<uint32_t>(e.mesh_idx), pc)) {
+        is_pces = (is_rep || e.type == ADV_TYPE_ROOM) && PcesProto::answersPces(the_mesh.advertFeat1(pc.id.pub_key));
+        has_pces_path = the_mesh.uiRoutePinned(pc.id.pub_key);
+      }
     }
+    static const char kPcesPathTxt[] = "PCES path";
     const lv_coord_t pces_w = is_pces
         ? (lv_coord_t)(lv_txt_get_width("PCES", 4, &g_font_semi_12, 0, LV_TEXT_FLAG_NONE) + 12) : 0;
+    const lv_coord_t path_w = has_pces_path
+        ? (lv_coord_t)(lv_txt_get_width(kPcesPathTxt, sizeof kPcesPathTxt - 1, &g_font_semi_12, 0, LV_TEXT_FLAG_NONE) + 12) : 0;
     const lv_coord_t name_w = LV_MAX((lv_coord_t)40, (lv_coord_t)LV_MIN(name_full,
-        name_room - (e.is_fav ? star_w : 0) - (is_pces ? pces_w + 6 : 0)));
+        name_room - (e.is_fav ? star_w : 0) - (is_pces ? pces_w + 6 : 0) - (has_pces_path ? path_w + 6 : 0)));
     lv_obj_t* nm = lv_label_create(rb);
     lv_label_set_long_mode(nm, LV_LABEL_LONG_DOT);
     lv_label_set_text(nm, san);
@@ -51320,6 +51328,19 @@ static void refreshContactsList() {
       lv_obj_set_style_pad_hor(pb, 5, LV_PART_MAIN);
       lv_obj_set_style_pad_ver(pb, 0, LV_PART_MAIN);
       lv_obj_align(pb, LV_ALIGN_TOP_LEFT, text_x + name_w + 6 + (e.is_fav ? star_w : 0), kNameY + 1);
+    }
+    if (has_pces_path) {
+      lv_obj_t* pp = lv_label_create(rb);
+      lv_label_set_text(pp, kPcesPathTxt);
+      lv_obj_set_style_text_font(pp, &g_font_semi_12, LV_PART_MAIN);
+      lv_obj_set_style_text_color(pp, lv_color_hex(COLOR_ON_GLOW), LV_PART_MAIN);
+      lv_obj_set_style_bg_color(pp, lv_color_hex(COLOR_GLOW), LV_PART_MAIN);
+      lv_obj_set_style_bg_opa(pp, LV_OPA_COVER, LV_PART_MAIN);
+      lv_obj_set_style_radius(pp, 6, LV_PART_MAIN);
+      lv_obj_set_style_pad_hor(pp, 5, LV_PART_MAIN);
+      lv_obj_set_style_pad_ver(pp, 0, LV_PART_MAIN);
+      lv_obj_align(pp, LV_ALIGN_TOP_LEFT,
+                   text_x + name_w + 6 + (e.is_fav ? star_w : 0) + (is_pces ? pces_w + 6 : 0), kNameY + 1);
     }
 
     // What it is, and how we reach it: "Repeater · 2 hops", "Room · direct".

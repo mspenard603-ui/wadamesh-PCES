@@ -210,18 +210,34 @@ public:
   int uiSendRequestAfterGuestLogin(ContactInfo& recipient, UiReqKind kind);
   int uiSendAdminLogin(ContactInfo& recipient, const char* password);       // backend login (demo: its repeater / room)
   int uiSendGuestLoginKeepPath(ContactInfo& recipient) { return uiSendAdminLogin(recipient, ""); }   // the mirror resets nothing
-  // PCES-pinned routes: nothing here wipes a route on a failed request, so only the record is kept.
-  void uiPinRoute(const uint8_t pub_key[32], bool pin) {
-    uint32_t pfx; memcpy(&pfx, pub_key, 4);
-    for (auto& p : _pinned) if (p == pfx) { if (!pin) p = 0; return; }
-    if (pin) for (auto& p : _pinned) if (!p) { p = pfx ? pfx : 1; return; }
+  // PCES-pinned routes, as on the device (src/MyMesh.h): a pin counts only while the
+  // contact still has the route it was given.
+  static uint32_t routeFingerprint(const ContactInfo& c) {
+    uint32_t h = 2166136261u ^ c.out_path_len;
+    const uint8_t n = (c.out_path_len == OUT_PATH_UNKNOWN) ? 0 : (uint8_t)((c.out_path_len & 63) * ((c.out_path_len >> 6) + 1));
+    for (uint8_t i = 0; i < n && i < MAX_PATH_SIZE; ++i) h = (h ^ c.out_path[i]) * 16777619u;
+    return h ? h : 1;
   }
-  bool uiRoutePinned(const uint8_t pub_key[32]) const {
-    uint32_t pfx; memcpy(&pfx, pub_key, 4);
-    for (auto p : _pinned) if (p && p == pfx) return true;
+  void uiPinRoute(const uint8_t pub_key[32], bool pin) {
+    uint32_t pfx; memcpy(&pfx, pub_key, 4); if (!pfx) pfx = 1;
+    int slot = -1;
+    for (int i = 0; i < 16; ++i) if (_pinned[i] == pfx) slot = i;
+    if (!pin) { if (slot >= 0) _pinned[slot] = _pinned_fp[slot] = 0; return; }
+    ContactInfo* c = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
+    if (!c) return;
+    for (int i = 0; slot < 0 && i < 16; ++i) if (!_pinned[i]) slot = i;
+    if (slot < 0) slot = 15;
+    _pinned[slot] = pfx; _pinned_fp[slot] = routeFingerprint(*c);
+  }
+  bool uiRoutePinned(const uint8_t pub_key[32]) {
+    uint32_t pfx; memcpy(&pfx, pub_key, 4); if (!pfx) pfx = 1;
+    for (int i = 0; i < 16; ++i) if (_pinned[i] == pfx) {
+      ContactInfo* c = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
+      return c && routeFingerprint(*c) == _pinned_fp[i];
+    }
     return false;
   }
-  uint32_t _pinned[16] = {0};
+  uint32_t _pinned[16] = {0}, _pinned_fp[16] = {0};
   int uiSendAdminCommand(ContactInfo& recipient, const char* text);         // backend CLI line
   int uiRoomRelogin(const uint8_t pub_key[32]);
   int sendRegionsRequestForUI(const uint8_t pub_key[PUB_KEY_SIZE], uint32_t& est_timeout);

@@ -447,6 +447,7 @@ void pcesInstall(bool backed) {
   slot->backed = backed;
   if (the_mesh.uiSetContactPath(t->id.pub_key, s_pces->route, (uint8_t)s_pces->route_hops, s_pces->plan.width)) {
     the_mesh.uiPinRoute(t->id.pub_key, true);   // a failed Ping or a login must not wipe it
+    contactsListMarkStale();                    // the "PCES path" badge
     pcesLog(SET_TONE_OK, "%s", backed ? TR("4. Accepted and installed (unverified until used). Restore puts the old route back.")
                                       : TR("Installed anyway (unverified). Restore puts the old route back."));
   } else {
@@ -715,6 +716,7 @@ void pcesRestoreCb(lv_event_t* e) {
   else
     ok = the_mesh.uiSetContactPath(a.pub, a.old_path, (uint8_t)(a.old_len & 63), (uint8_t)((a.old_len >> 6) + 1));
   the_mesh.uiPinRoute(a.pub, false);
+  contactsListMarkStale();
   a.used = false;
   pcesLogClear();
   pcesLog(ok ? SET_TONE_OK : SET_TONE_DANGER, "%s", ok ? TR("Previous route restored.") : TR("Could not restore: contact gone."));
