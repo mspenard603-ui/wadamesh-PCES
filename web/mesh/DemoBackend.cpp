@@ -131,6 +131,15 @@ public:
       c.lastmod = now - d.age_s;
       c.gps_lat = absCoord(_home_lat, d.dlat);
       c.gps_lon = absCoord(_home_lon, d.dlon);
+      // WADA_DEMO_PCES=1: Diego is reached through Hilltop > Ridge (2-byte hops), so the
+      // PCES route screen has a route to improve (web/scripts/pces-route.wada).
+      const char* pe = getenv("WADA_DEMO_PCES");
+      if (pe && pe[0] == '1' && strcmp(d.name, "Diego") == 0) {
+        uint8_t k[PUB_KEY_SIZE];
+        demoKey("Hilltop Repeater", k); memcpy(c.out_path, k, 2);
+        demoKey("Ridge Repeater", k);   memcpy(c.out_path + 2, k, 2);
+        c.out_path_len = (uint8_t)((1 << 6) | 2);
+      }
       ev.beContact(c, false, 0);
     }
     // WADA_DEMO_CONTACTS="name|name|...": extra chat contacts for a scripted run, so a
@@ -448,6 +457,28 @@ private:
     auto u16 = [&](uint16_t v) { r.push_back((uint8_t)v); r.push_back((uint8_t)(v >> 8)); };
     auto u32 = [&](uint32_t v) { for (int i = 0; i < 4; ++i) r.push_back((uint8_t)(v >> (8 * i))); };
     switch (ql ? q[0] : 0) {
+      case 0xC5: {   // PCES (Commsol path service, src/helpers/PcesProto.h): a canned station
+        if (ql < 3 || q[1] != 1) return;   // other versions: no answer
+        r.push_back(1); r.push_back(q[2]);
+        if (q[2] == 0x00) {                // INFO: 7-day window, 42 links, newest 3 min, -7.5 dB, SF11
+          r.push_back(0); u16(168); u16(42); u16(3); r.push_back((uint8_t)(int8_t)-30); r.push_back(11);
+        } else if (q[2] == 0x01 && ql >= 6) {   // PATH: A > Lars > B, whatever A and B were
+          const uint8_t w = q[3], la = q[4];
+          if (w < 1 || w > 3 || ql < 6u + la || la < w) { r.push_back(6); break; }   // bad request
+          const uint8_t lb = q[5 + la];
+          if (ql < 6u + la + lb) { r.push_back(6); break; }
+          uint8_t mid[PUB_KEY_SIZE]; demoKey("Lars", mid);
+          r.push_back(0); r.push_back(72); r.push_back(26);          // metric 72, weakest +6.5 dB
+          r.push_back(lb ? 0 : 2);                                  // B = 0 bytes: ends at the station
+          r.push_back(lb >= w ? 3 : 2);
+          r.insert(r.end(), q + 5, q + 5 + w);
+          r.insert(r.end(), mid, mid + w);
+          if (lb >= w) r.insert(r.end(), q + 6 + la, q + 6 + la + w);
+        } else {
+          r.push_back(9);                  // LINK and anything else: unsupported in the demo
+        }
+        break;
+      }
       case 0x06: {   // GET_NEIGHBOURS: count at [2], offset [3..4], prefix length [6]
         const uint8_t plen = (ql > 6 && q[6] >= 1 && q[6] <= 8) ? q[6] : 4;
         static const char* const kNb[] = { "Sanne", "Diego", "Ridge Repeater", "Harbor Room", "Lars", "Femke" };

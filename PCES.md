@@ -7,67 +7,83 @@ results, and you can install the answer as a contact's route. The protocol of
 record is Commsol's `docs/pces.md`. Its reference encoder and decoder are in
 `src/commsol/pces.py`.
 
-PCES itself is a Lua app, `deploy/apps/pces`. The firmware gains a small,
-consent-gated SDK extension that any client of a node-hosted service can use.
-PCES is the first such client.
+PCES is **native firmware, not a Lua app**. wadamesh deliberately keeps
+transmissions out of Lua: apps cannot log in to nodes or send them requests. PCES
+needs both, so it lives in the firmware next to the repeater admin app and reuses
+its plumbing. The Lua SDK is unchanged.
 
-## SDK additions (`wada.mesh`, boards with `sdk_ext`)
+## Using it
 
-| Call | What it does | Grant |
-|---|---|---|
-| `contacts()[i].feat1` | The advert feature-1 word the node last announced (0 = none). Commsol nodes advertise `0xC5xx`, and bit 1 means "answers PCES". | none (it is broadcast) |
-| `login(who [, password])` | Login to a repeater or room. The result arrives in `app.on_login{pubkey, ok, perms, err}` within 20 s. Blank = guest; the Commsol station admits a blank login as a PCES-only guest. | requests |
-| `request(who, data [, timeout_ms])` | Sends a binary REQ, `data[1]` = request type. Returns `"direct"`/`"flood"`. The answer (minus its 4-byte tag) arrives in `app.on_reply{pubkey, ok, data, rtt_ms, err}`. Default timeout 30 s, at most 40 s. | requests |
-| `route(who)` | `{hops = {"3a7d", ...}, hash_size = 2}`, or `false` when the contact has no route (floods). | none |
-| `set_route(who, hops)` | Installs `hops` as the contact's out path; `{}` = direct, `nil` = forget (flood and relearn). | routes |
-| `path_hash_size()` | Bytes per hop this node uses, 1 to 3. | none |
+1. Open a contact's action sheet (tap it in Contacts) and choose **PCES route**.
+2. **Server.** The screen uses the first repeater or room that advertises the PCES marker. Its advert feature 1 is `0xC5xx` with bit 1 set, and the station's repeater identity advertises `0xC502`. The marker is optional, so when no contact advertises it, the screen lists your repeaters and rooms to pick from. **Server info** asks the station for INFO: link count, data window, newest measurement age and SF.
+3. **Ask PCES for a route.** Following the spec, A is your first hop, the first relay of the contact's current route. B is the contact itself when it is a repeater or room, otherwise the last relay of its route. A contact with no route yet can't be planned: message it once so MeshCore learns a path.
+4. The first ask logs in to the server with a blank password, which the station accepts as a PCES-only guest. It waits 2.5 s, so the request doesn't collide with the re-flooded login reply, then sends `C5 01 01 [width] A B`. The guest session is reused for 15 minutes.
+5. **Answer.** The screen shows the metric (0 to 100), the weakest-leg SNR, the PCES path and the route that would be installed. Nothing changes until you tap **Use this route**. The replaced route is kept, and **Restore route** puts it back.
 
-`who` is a contact name, or the 8-hex pubkey prefix that `contacts()` reports.
-Check `wada.sys.caps().node_requests` and `.feat1` before using these calls.
+### Automatic: best path to a PCES server when its advert arrives
 
-Safety rules match the rest of the SDK:
-- The first `login`/`request` from an app asks the user, naming the app. The first `set_route` asks separately. A refusal is remembered. Both grants appear under Settings > App permissions.
-- `login` and `request` each have a 12 s per-app floor, so at most 5 a minute, which matches the PCES server's limit.
-- Both calls refuse when the TX budget is nearly spent.
-- The firmware never retries.
-- One request is in flight at a time. It shares the touch UI's single-flight request slot, so it waits behind (and never clobbers) a status, telemetry or admin request.
+When an advert carrying the PCES marker reaches the device through relays, the
+firmware asks that server, unprompted, for the best path to itself. A is the relay
+that handed us the advert, the last hash on its flood path. B is the station itself
+(length 0). This is the spec's worked example. The ask uses the same login and
+request as the screen.
 
-### Firmware changes
+- An advert heard direct (0 hops) is ignored: there is no path to improve.
+- Each server is asked at most once per boot and then not again for 6 hours, whether or not it answered. There is a single attempt and no retry.
+- A queued ask waits up to 60 s for a free moment. It never runs while the PCES screen is open, while anything else holds the request slot, or within 12 s of the last PCES request. Otherwise it is dropped.
+- Answer, when the server contact has **no route yet**: the route is installed and a toast says so ("PCES: route to X installed (metric N)"). MeshCore still floods and relearns if it stops working.
+- Answer, when the server contact **already has a route**: the route is left alone. The toast points to **PCES route** on that contact, where the answer is waiting with **Use this route**.
+- The server must already be a contact, because a login needs its key. Adverts from nodes that aren't contacts are ignored.
 
-- `src/MyMesh.h`:
-  - `onAdvertRecv` override that keeps feature 1, which the core parses and then drops.
-  - `advertFeat1()`: a 64-entry RAM cache, falling back to the stored raw advert blob for nodes heard before boot.
-  - `uiSetContactPath()`.
-- `src/ui-touch/UITask.cpp`:
-  - `luaHost*` glue for the calls above.
-  - The two new permission prompts and their Settings rows.
-  - Lua hooks in front of the repeater admin app's `onBinaryReply` / `onAdminLoginResult`.
-- `src/ui-touch/LuaAppHost.cpp`: the bindings, reply polling (replies arrive inside packet reception), caps, and teardown.
-- `web/mesh/WebMesh.*`: stand-ins so the browser build keeps compiling. Routes are only mirrored there.
+The hook is `MyMesh::onAdvertRecv` → `takePcesAdvert()`. The ask runs from the service
+tick in `PcesApp.h` (`pcesAutoTick`), which `UITask::loop` starts.
 
-## The PCES app
+On-air etiquette from the Commsol spec, enforced by the screen and the automatic ask:
+- It sends only on a tap or a PCES server's advert (rate-limited as above), never on a timer or in a loop over contacts.
+- Each tap makes one attempt. No answer after 40 s is reported, never retried.
+- At most one request every 12 s, so 5 a minute, matching the server's limit.
+- It shares the UI's single-flight request slot, so it waits behind status, telemetry and admin requests and never clobbers them.
 
-1. **Server.** The app pre-selects a contact that advertises the PCES marker (`0xC502` on the station's repeater identity). *Pick* lists every repeater and room, because the marker is optional.
-2. **Contact.** Tap a contact, then **Ask PCES for a route**. The app works out A and B as the spec says:
-   - A is your first-hop repeater: the first hop of the current route, or the *Home repeater* you set when there is no route yet.
-   - B is the contact itself when it is a relay, else the last relay of its current route. A chat contact you have never had a route to can't be planned. Message it once so MeshCore learns a path.
-3. **Login, then PATH.** The first ask in a session sends a blank login and waits for LOGIN_OK. It then waits 2.5 s, so the request doesn't collide with the re-flooded login reply, and sends `C5 01 01 [width] A B`. Later asks skip the login.
-4. **Answer.** The answer screen shows the metric (0 to 100), the weakest-leg SNR, the hops PCES returned, the route that would be installed, and the current route. Nothing changes until you tap **Use this route**. The original route is kept, and **Restore route** puts it back.
-5. **Server info** sends INFO and shows the link count, data window, newest measurement age and SF.
+## Code
 
-Etiquette from the Commsol spec, enforced by the app: it sends only on a tap, never on a timer or a loop over contacts, and makes one attempt per tap. A request with no answer is reported, not retried.
+| File | What |
+|---|---|
+| `src/helpers/PcesProto.h` | Pure codec: INFO/PATH/LINK encode and decode, status texts, the feature-1 marker, A/B planning and answer-to-route conversion. No Arduino or LVGL. |
+| `src/ui-touch/PcesApp.h` | The screen. It is included into `UITask.cpp` after `RepeaterAdminApp.h` and shares its helpers. Login goes through `uiSendAdminLogin`, the request through `uiSendBinaryRequest`, and replies are routed from `UITask::onAdminLoginResult` / `onBinaryReply`. |
+| `src/MyMesh.h` | `onAdvertRecv` override that keeps advert feature 1, which the core parses and drops, and records PCES server adverts heard through relays (`takePcesAdvert`). `advertFeat1()` reads it from a 64-entry RAM cache, falling back to the stored advert blob. `uiSetContactPath()` installs a route. |
+| `src/ui-touch/UITask.cpp` | The "PCES route" button on the contact action sheet, the reply hooks, and Back/Esc via the popup registry. |
+| `web/mesh/WebMesh.*` | Stand-ins for the browser and host builds. Routes are only mirrored there. |
+| `web/mesh/DemoBackend.cpp` | With `WADA_DEMO_PCES=1`, Hilltop Repeater answers as a canned PCES station and Diego has a 2-hop route to improve. `WADA_DEMO_PCES_ADVERT=1` (in `WebMesh.cpp`) fakes a PCES server advert. |
 
 ## Testing
 
-- Host: `lua5.4 test/lua/pces_app_test.lua`. It covers:
-  - the codec against the spec's worked example, plus LINK, INFO and error statuses;
-  - A/B planning;
-  - the whole tap → login → request → answer → install → restore flow against a stubbed `wada.*`, including "nothing is transmitted on open" and "no answer is not retried".
-- Device: build any `sdk_ext` board, for example `pio run -e LilyGo_TDeck_companion_radio_touch`. Copy `deploy/apps/pces/0.1/pces.lua` and `pces.json` to `/meshcomod/apps/` on the SD card, or `/apps/` on boards without one. PCES then appears in the app drawer. You need a Commsol station in range with Commsol running and able to transmit.
+- **Codec, host:**
+
+  ```
+  c++ -std=c++17 -Wall -Wextra -I src test/test_pces_proto.cpp -o /tmp/t
+  /tmp/t
+  ```
+
+  This checks the spec's worked example, LINK, INFO, error statuses, malformed replies, A/B planning, and answers that must be refused (wrong width, not starting at your first hop).
+- **Whole screen, host simulator:** run `web/build.sh host`, then:
+
+  ```
+  WADA_DEMO_PCES=1 web/build-host/wadamesh-host --headless --script web/scripts/pces-route.wada --shots /tmp/pces
+  ```
+
+  This drives open → choose server → ask → answer → install → restore → the 12 s floor, and screenshots each step.
+- **Automatic ask, host simulator:**
+
+  ```
+  WADA_DEMO_PCES=1 WADA_DEMO_PCES_ADVERT=1 web/build-host/wadamesh-host --headless --script web/scripts/pces-auto.wada --shots /tmp/pces
+  ```
+
+  A fake advert 8 s after boot marks Hilltop Repeater as a PCES server heard via Harbor Room. Expect the "route installed" toast, then Hilltop's PCES screen showing that route.
+- **Device:** `pio run -e LilyGo_TDeck_companion_radio_touch` builds. The other boards and hardware are untested. You need a Commsol station in range, running and able to transmit.
 
 ## Not done in this proof of concept
 
-- No "PCES" badge in the native contact list. The marker is only visible to apps.
-- LINK is encoded and decoded but has no screen yet.
-- The browser build doesn't push `set_route` to its companion backend.
-- Hardware-tested: not yet. The firmware compiles and the app passes its host test.
+- No "PCES" badge in the contact list.
+- LINK is encoded and decoded but has no screen.
+- The chosen server and the saved "Restore" route live in RAM only. They are lost on reboot, and only the last replaced route is kept.
+- Not yet tested on hardware or against a real station.

@@ -261,6 +261,22 @@ bool MyMesh::uiSetContactPath(const uint8_t pub_key[32], const uint8_t* path, ui
   slot->out_path_len = (uint8_t)(((hash_sz - 1) << 6) | hops);
   return true;
 }
+bool MyMesh::takePcesAdvert(uint8_t pub[32], uint8_t hop[3], uint8_t* width, uint8_t* hops) {
+  static bool fired = false;
+  const char* e = getenv("WADA_DEMO_PCES_ADVERT");
+  if (fired || !e || e[0] != '1' || millis() < 8000) return false;
+  const ContactInfo *srv = nullptr, *via = nullptr;
+  for (int i = 0; i < _num_contacts; i++) {
+    if (strcmp(_contacts[i].name, "Hilltop Repeater") == 0) srv = &_contacts[i];
+    if (strcmp(_contacts[i].name, "Harbor Room") == 0) via = &_contacts[i];
+  }
+  if (!srv || !via) return false;
+  fired = true;
+  memcpy(pub, srv->id.pub_key, PUB_KEY_SIZE);
+  memcpy(hop, via->id.pub_key, 2);
+  *width = 2; *hops = 2;
+  return true;
+}
 bool MyMesh::uiShareContact(const uint8_t pub_key[32]) {
   if (!_backend || !lookupContactByPubKey(pub_key, PUB_KEY_SIZE)) return false;
   return _backend->shareContact(pub_key);

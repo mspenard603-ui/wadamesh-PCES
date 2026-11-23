@@ -117,13 +117,13 @@ public:
   void resetPathTo(ContactInfo& recipient);
   int uiContactIdxByPubKey(const uint8_t pub_key[32]);
   bool uiResetContactPath(const uint8_t pub_key[32]);
-  // PCES / wada.mesh.set_route: the browser build edits only its mirror (the backend
+  // PCES route screen: the browser build edits only its mirror (the backend
   // has no "set path" call yet); the device firmware persists it (src/MyMesh.h).
   bool uiSetContactPath(const uint8_t pub_key[32], const uint8_t* path, uint8_t hops, uint8_t hash_sz);
   uint16_t advertFeat1(const uint8_t pub_key[32]) { (void)pub_key; return 0; }   // not mirrored
-  static bool contactNeedsGuestLogin(const ContactInfo& c) {
-    return c.type == ADV_TYPE_REPEATER || c.type == ADV_TYPE_ROOM || c.type == ADV_TYPE_SENSOR;
-  }
+  // No raw adverts reach the browser build. WADA_DEMO_PCES_ADVERT=1 fakes one, 8 s after boot:
+  // Hilltop Repeater as a PCES server heard via Harbor Room (web/scripts/pces-auto.wada).
+  bool takePcesAdvert(uint8_t pub[32], uint8_t hop[3], uint8_t* width, uint8_t* hops);
   bool uiShareContact(const uint8_t pub_key[32]);       // companion: CMD_SHARE_CONTACT; demo: false
   bool uiSetContactGps(const uint8_t pub_key[32], int32_t lat_e6, int32_t lon_e6);
   bool uiAddManualContact(const uint8_t pub_key[32], const char* name);

@@ -1525,12 +1525,39 @@ private:
   // (see advertFeat1). Everything else is BaseChatMesh's normal advert handling.
   void onAdvertRecv(mesh::Packet* packet, const mesh::Identity& id, uint32_t timestamp,
                     const uint8_t* app_data, size_t app_data_len) override {
+    uint16_t feat1 = 0;
     if (app_data && app_data_len > 0) {
       AdvertDataParser p(app_data, (uint8_t)app_data_len);
-      if (p.isValid()) rememberFeat1(id.pub_key, p.getFeat1());
+      if (p.isValid()) { feat1 = p.getFeat1(); rememberFeat1(id.pub_key, feat1); }
     }
     BaseChatMesh::onAdvertRecv(packet, id, timestamp, app_data, app_data_len);
+    // A PCES server's advert that reached us through relays: note the relay next to us
+    // (the last hash a flood path carries) so the touch UI can ask that server for the
+    // best path back to it (PcesApp.h, pcesServiceTick). Heard direct = nothing to ask.
+    if ((feat1 & 0xFF00) == 0xC500 && (feat1 & 0x0002) && packet && packet->isRouteFlood()) {
+      const uint8_t n = packet->getPathHashCount(), sz = packet->getPathHashSize();
+      if (n > 0 && sz <= 3) {
+        memcpy(_pces_adv_pub, id.pub_key, PUB_KEY_SIZE);
+        memcpy(_pces_adv_hop, &packet->path[(size_t)(n - 1) * sz], sz);
+        _pces_adv_width = sz;
+        _pces_adv_hops = n;
+        _pces_adv_pending = true;
+      }
+    }
   }
+public:
+  /** The latest PCES server advert heard through relays (see onAdvertRecv): its key,
+   *  the relay adjacent to us (`width` bytes) and how many relays it crossed. One slot,
+   *  newest wins; taking it clears it. */
+  bool takePcesAdvert(uint8_t pub[PUB_KEY_SIZE], uint8_t hop[3], uint8_t* width, uint8_t* hops) {
+    if (!_pces_adv_pending) return false;
+    _pces_adv_pending = false;
+    memcpy(pub, _pces_adv_pub, PUB_KEY_SIZE);
+    memcpy(hop, _pces_adv_hop, 3);
+    *width = _pces_adv_width; *hops = _pces_adv_hops;
+    return true;
+  }
+private:
   void rememberFeat1(const uint8_t* pub_key, uint16_t f) {
     uint32_t pfx; memcpy(&pfx, pub_key, 4);
     uint8_t slot = _feat1_next;
@@ -1655,6 +1682,11 @@ private:
   uint16_t _feat1_val[kFeat1Slots] = {0};
   bool     _feat1_known[kFeat1Slots] = {false};
   uint8_t  _feat1_next = 0;
+  // takePcesAdvert slot.
+  bool     _pces_adv_pending = false;
+  uint8_t  _pces_adv_pub[PUB_KEY_SIZE] = {0};
+  uint8_t  _pces_adv_hop[3] = {0};
+  uint8_t  _pces_adv_width = 0, _pces_adv_hops = 0;
 
   TransportKey send_scope;
   TransportKey _chan_scope_saved;             // push/popChannelScope stash

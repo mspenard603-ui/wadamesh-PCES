@@ -1,0 +1,30 @@
+# PCES route screen (src/ui-touch/PcesApp.h), web host build, demo backend with a
+# canned PCES station on Hilltop Repeater and a 2-hop route to Diego:
+#   WADA_DEMO_PCES=1 web/build-host/wadamesh-host --headless --script web/scripts/pces-route.wada --shots <dir>
+# Expect: pces-1 no marked server, Hilltop/Harbor offered; pces-2 Hilltop chosen;
+# pces-3 answer 72/100, +6.50 dB, new route BF78 > F733 > 7F33; pces-4 installed with
+# Restore offered; pces-5 back on BF78 > 7F33; pces-6 "Wait N s" (the 12 s floor).
+wait 5000
+tap 240 456
+wait 2000
+tap 200 320
+wait 1500
+tap 265 316
+wait 1500
+shot pces-1-open
+tap 400 296
+wait 1200
+shot pces-2-server
+tap 400 162
+wait 7000
+shot pces-3-answer
+tap 400 413
+wait 1200
+shot pces-4-installed
+tap 400 226
+wait 1200
+shot pces-5-restored
+tap 400 162
+wait 800
+shot pces-6-floor
+quit

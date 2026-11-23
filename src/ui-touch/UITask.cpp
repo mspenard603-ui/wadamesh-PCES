@@ -24452,6 +24452,17 @@ static void actionSheetAdminCb(lv_event_t* e) {
   openRepeaterAdmin(c);   // the admin app (login, status, settings, console)
 }
 
+static void openPces(const ContactInfo& c);   // PcesApp.h, included below
+// "PCES route": ask the Commsol path service for a better route to this contact.
+static void actionSheetPcesCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED || !g_lv.task) return;
+  ContactInfo c;
+  bool ok = the_mesh.getContactByIdx(s_action_sheet_mesh_idx, c);
+  closeActionSheet();
+  if (!ok) { g_lv.task->showAlert(TR("Contact gone"), 1200); return; }
+  openPces(c);
+}
+
 // "Join" a room server: same login mechanism as repeater admin (sendLogin is
 // room-aware and sends our sync_since so the server replays room history), but
 // on success we open the room's chat instead of the admin console. Stash the
@@ -24473,6 +24484,8 @@ static inline void setLabelIfChanged(lv_obj_t* lbl, const char* txt);
 static void openContactActionSheet(uint32_t mesh_idx, bool is_repeater, const char* name, bool from_map);
 static bool raOverlayAboveClose();   // closes a popup opened over the app (defined by the popup registry)
 #include "RepeaterAdminApp.h"
+// PCES route screen (Commsol path service): same translation-unit arrangement.
+#include "PcesApp.h"
 
 // Toggle a contact's favorite state. Persists in NVS via TouchPrefsStore (the
 // star marker + favorites filter) AND mirrors into the firmware contact
@@ -25276,7 +25289,7 @@ static void openContactActionSheet(uint32_t mesh_idx, bool is_repeater, const ch
   // block + share contact (7), + trace/admin for repeaters (2), + Join for
   // rooms (1), + line-of-sight (1), + Show on map (1 when contact has GPS and
   // !from_map).
-  const int grid_items = (from_map ? 5 : 8) + (is_repeater ? 2 : 0) + (is_room ? 2 : 0) + (has_los ? 1 : 0) + (has_map_btn ? 1 : 0);
+  const int grid_items = (from_map ? 5 : 9) + (is_repeater ? 2 : 0) + (is_room ? 2 : 0) + (has_los ? 1 : 0) + (has_map_btn ? 1 : 0);
   // P4 portrait: the 2-column grid cut most labels off with "..." on the narrow
   // panel, so every action gets its own full-width row. The card grows to fit and
   // the body scrolls past the screen height like any tall sheet. Landscape and the
@@ -25440,6 +25453,7 @@ static void openContactActionSheet(uint32_t mesh_idx, bool is_repeater, const ch
     mk_btn(TR(LV_SYMBOL_SETTINGS "  Admin"), actionSheetAdminCb, 0);
   }
   mk_btn(TR(LV_SYMBOL_WIFI "  Range test"), actionSheetRangeTestCb, 0);
+  if (!from_map) mk_btn(TR(LV_SYMBOL_SHUFFLE "  PCES route"), actionSheetPcesCb, 0);   // PcesApp.h
 #if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
   // Terrain-aware line-of-sight (needs both GPS fixes; gated by has_los).
   if (has_los) mk_btn(TR(LV_SYMBOL_GPS "  Sightline"), actionSheetLosCb, 0);
@@ -74875,14 +74889,8 @@ void UITask::onThreadsChanged() {
 #endif
 }
 
-#if CAP_LUA_SDK_EXT
-bool luaHostOnBinaryReply(const ContactInfo& contact, const uint8_t* data, size_t len);   // below
-bool luaHostOnLoginResult(const ContactInfo& contact, bool success, uint8_t perms);
-#endif
 void UITask::onBinaryReply(const ContactInfo& contact, const uint8_t* data, size_t len) {
-#if CAP_LUA_SDK_EXT
-  if (luaHostOnBinaryReply(contact, data, len)) return;   // a Lua app's wada.mesh.request
-#endif
+  if (pcesOnBinaryReply(contact, data, len)) return;   // a PCES answer (PcesApp.h)
   raOnBinaryReply(contact, data, len);   // otherwise only the repeater admin app sends these
 }
 
@@ -75771,9 +75779,7 @@ void UITask::onServerClock(const ContactInfo& contact, uint32_t server_epoch) {
 }
 
 void UITask::onAdminLoginResult(const ContactInfo& contact, bool success, uint8_t perms) {
-#if CAP_LUA_SDK_EXT
-  if (luaHostOnLoginResult(contact, success, perms)) return;   // a Lua app's wada.mesh.login
-#endif
+  if (pcesOnLoginResult(contact, success, perms)) return;  // the PCES screen's guest login
   if (raOnLoginResult(contact, success, perms)) return;   // the repeater admin app's login
   // Which pending attempt, if any, is this the reply to? Disarming the watchdog
   // used to be unconditional, which was harmless while it only drove a toast —
@@ -77203,12 +77209,6 @@ static void luaPubkeyHex(const uint8_t* pk, int n, char* out, size_t cap) {
   if (cap) out[o < cap ? o : cap - 1] = '\0';
 }
 
-// Advert feature-1 word (0 = none announced). Ungated, like the rest of contacts():
-// it is what the node itself broadcast to everyone in range.
-int luaHostContactFeat1(int idx) {
-  ContactInfo ci;
-  return (idx >= 0 && the_mesh.getContactByIdx((uint32_t)idx, ci)) ? the_mesh.advertFeat1(ci.id.pub_key) : 0;
-}
 int luaHostContactFlags(int idx) {
   ContactInfo ci;
   return (idx >= 0 && the_mesh.getContactByIdx((uint32_t)idx, ci)) ? ci.flags : 0;
@@ -77732,8 +77732,6 @@ static void buildAppPermsSettings() {
       { TR("Send private messages as me"), LUA_PERM_DM_SEND },
       { TR("Read private messages"), LUA_PERM_DM_READ },
       { TR("Send discovery probes"), LUA_PERM_PROBE },
-      { TR("Log in and send requests to nodes"), LUA_PERM_REQUEST },
-      { TR("Change contact routes"), LUA_PERM_ROUTE },
     };
     for (const auto& p : perms)   // user_data packs the app index and the bit, one callback for all
       setSwitchRow(c, p.label, nullptr, (mask & p.bit) != 0, appPermsToggleCb,
@@ -77811,170 +77809,6 @@ bool luaHostPingTakeResult(int8_t* their_snr, int8_t* our_snr, uint8_t* extra_ho
   return true;
 }
 void luaHostPingCancel() { s_lua_ping_tag = 0; s_lua_ping_done = false; }
-
-#if CAP_LUA_SDK_EXT
-// ---- wada.mesh.login / request / route / set_route ---------------------------
-// The calls a client of a server-side node service needs: Commsol's PCES (path
-// computation) is the first. A login and a binary REQ are what the repeater admin
-// app already sends, so they reuse its single-flight slot and reply hooks; the
-// Lua side only adds consent, a rate floor and an app-facing timeout.
-//
-// Two grants, because they are different acts. "Requests" transmits under your
-// identity to ONE node you name (never a flood of the mesh, never a message in your
-// name). "Routes" changes how your own future messages to a contact travel.
-
-// Contact by name, or by the 8-hex pubkey prefix contacts() reports.
-static ContactInfo* luaFindContact(const char* who) {
-  if (!who || !*who) return nullptr;
-  const uint32_t n = the_mesh.getNumContacts();
-  for (uint32_t i = 0; i < n; ++i) {
-    ContactInfo c;
-    if (!the_mesh.getContactByIdx(i, c)) continue;
-    char hex[12];
-    luaPubkeyHex(c.id.pub_key, 4, hex, sizeof hex);
-    if (strcmp(c.name, who) == 0 || strcasecmp(hex, who) == 0)
-      return the_mesh.lookupContactByPubKey(c.id.pub_key, PUB_KEY_SIZE);
-  }
-  return nullptr;
-}
-
-int luaHostReqPerm(const char* app_id) {
-  bool asked = false;
-  const int mask = luaHostAppPerms(app_id, &asked);
-  if (!asked) return 0;
-  return (mask & LUA_PERM_REQUEST) ? 1 : -1;
-}
-void luaHostRequestReqPerm(const char* app_id, const char* app_name) {
-  if (!app_id || !*app_id) return;
-  snprintf(s_lua_perm_target, sizeof s_lua_perm_target, "%s", app_id);
-  luaPermSetBit(app_id, LUA_PERM_REQUEST, false);   // refused unless the user says otherwise
-  const char* label = (app_name && *app_name) ? app_name : app_id;
-  char msg[260];
-  snprintf(msg, sizeof msg,
-           TR("\"%s\" wants to log in to nodes and send them requests.\n\n"
-              "Each request is a transmission from %s to one repeater or room you "
-              "pick. No message is posted in your name.\n\n"
-              "Only allow this for an app you trust."),
-           label, the_mesh.getNodePrefs()->node_name);
-  showConfirm(msg, TR("Allow"), +[]() { luaPermSetBit(s_lua_perm_target, LUA_PERM_REQUEST, true); });
-}
-int luaHostRoutePerm(const char* app_id) {
-  bool asked = false;
-  const int mask = luaHostAppPerms(app_id, &asked);
-  if (!asked) return 0;
-  return (mask & LUA_PERM_ROUTE) ? 1 : -1;
-}
-void luaHostRequestRoutePerm(const char* app_id, const char* app_name) {
-  if (!app_id || !*app_id) return;
-  snprintf(s_lua_perm_target, sizeof s_lua_perm_target, "%s", app_id);
-  luaPermSetBit(app_id, LUA_PERM_ROUTE, false);
-  const char* label = (app_name && *app_name) ? app_name : app_id;
-  char msg[240];
-  snprintf(msg, sizeof msg,
-           TR("\"%s\" wants to change the routes your messages take to contacts.\n\n"
-              "A bad route only delays delivery: the mesh floods and relearns one "
-              "if it stops working."),
-           label);
-  showConfirm(msg, TR("Allow"), +[]() { luaPermSetBit(s_lua_perm_target, LUA_PERM_ROUTE, true); });
-}
-
-// Replies arrive inside packet reception, where app code must not run: park them
-// here for the app's poll timer (LuaAppHost.cpp), like the ping result above.
-static uint8_t  s_lua_req_pub[PUB_KEY_SIZE];
-static bool     s_lua_req_armed = false, s_lua_req_done = false;
-static uint8_t  s_lua_req_buf[MAX_PACKET_PAYLOAD];
-static uint8_t  s_lua_req_len = 0;
-static uint8_t  s_lua_login_pub[PUB_KEY_SIZE];
-static bool     s_lua_login_armed = false, s_lua_login_done = false, s_lua_login_ok = false;
-static uint8_t  s_lua_login_perms = 0;
-
-uint32_t luaHostMeshLogin(const char* who, const char* password, const char** err) {
-  ContactInfo* c = luaFindContact(who);
-  if (!c) { *err = "no such contact"; return 0; }
-  if (!MyMesh::contactNeedsGuestLogin(*c)) { *err = "not a server"; return 0; }
-  if (s_lua_login_armed) { *err = "busy"; return 0; }
-  if (the_mesh.getRemainingTxBudget() < 300) { *err = "rate limited"; return 0; }
-  const int r = the_mesh.uiSendAdminLogin(*c, password ? password : "");
-  if (r != MSG_SEND_SENT_FLOOD && r != MSG_SEND_SENT_DIRECT) { *err = "radio busy"; return 0; }
-  memcpy(s_lua_login_pub, c->id.pub_key, PUB_KEY_SIZE);
-  s_lua_login_armed = true; s_lua_login_done = false;
-  return 1;
-}
-bool luaHostOnLoginResult(const ContactInfo& contact, bool success, uint8_t perms) {
-  if (!s_lua_login_armed || memcmp(contact.id.pub_key, s_lua_login_pub, PUB_KEY_SIZE) != 0) return false;
-  s_lua_login_ok = success; s_lua_login_perms = perms; s_lua_login_done = true;
-  return true;
-}
-// 1 = answered (ok/perms filled), 0 = still waiting.
-int luaHostLoginTake(bool* ok, int* perms, char* pk_hex, size_t pk_cap) {
-  if (!s_lua_login_armed || !s_lua_login_done) return 0;
-  *ok = s_lua_login_ok; *perms = s_lua_login_perms;
-  luaPubkeyHex(s_lua_login_pub, 4, pk_hex, pk_cap);
-  s_lua_login_armed = s_lua_login_done = false;
-  return 1;
-}
-void luaHostLoginCancel(char* pk_hex, size_t pk_cap) {
-  if (pk_hex) luaPubkeyHex(s_lua_login_pub, 4, pk_hex, pk_cap);
-  s_lua_login_armed = s_lua_login_done = false;
-}
-
-uint32_t luaHostMeshRequest(const char* who, const uint8_t* data, size_t len, const char** err,
-                            char* pk_hex, size_t pk_cap) {
-  ContactInfo* c = luaFindContact(who);
-  if (!c) { *err = "no such contact"; return 0; }
-  if (!len || len > MAX_PACKET_PAYLOAD - 32) { *err = "bad length"; return 0; }
-  if (s_lua_req_armed || the_mesh.hasUIRequestPending()) { *err = "radio busy"; return 0; }
-  if (the_mesh.getRemainingTxBudget() < 300) { *err = "rate limited"; return 0; }
-  const int r = the_mesh.uiSendBinaryRequest(*c, data, (uint8_t)len);
-  if (r != MSG_SEND_SENT_FLOOD && r != MSG_SEND_SENT_DIRECT) { *err = "radio busy"; return 0; }
-  memcpy(s_lua_req_pub, c->id.pub_key, PUB_KEY_SIZE);
-  luaPubkeyHex(c->id.pub_key, 4, pk_hex, pk_cap);
-  s_lua_req_armed = true; s_lua_req_done = false; s_lua_req_len = 0;
-  return (r == MSG_SEND_SENT_FLOOD) ? 2 : 1;   // the caller reports which way it went
-}
-bool luaHostOnBinaryReply(const ContactInfo& contact, const uint8_t* data, size_t len) {
-  if (!s_lua_req_armed || memcmp(contact.id.pub_key, s_lua_req_pub, PUB_KEY_SIZE) != 0) return false;
-  s_lua_req_len = (uint8_t)(len < sizeof s_lua_req_buf ? len : sizeof s_lua_req_buf);
-  memcpy(s_lua_req_buf, data, s_lua_req_len);
-  s_lua_req_done = true;
-  return true;
-}
-// Returns the reply length (>= 0) once answered, -1 while still waiting.
-int luaHostRequestTake(uint8_t* out, size_t cap) {
-  if (!s_lua_req_armed || !s_lua_req_done) return -1;
-  const size_t n = s_lua_req_len < cap ? s_lua_req_len : cap;
-  memcpy(out, s_lua_req_buf, n);
-  s_lua_req_armed = s_lua_req_done = false;
-  return (int)n;
-}
-void luaHostRequestCancel() {
-  if (s_lua_req_armed && !s_lua_req_done) the_mesh.cancelUIPingPending();   // free the slot
-  s_lua_req_armed = s_lua_req_done = false;
-}
-
-// A contact's stored out path. Returns -1 when the contact is unknown, 0 when it
-// has no path (messages flood), else 1 with hops/hash_sz/bytes filled in.
-int luaHostContactRoute(const char* who, uint8_t* path, int* hops, int* hash_sz) {
-  ContactInfo* c = luaFindContact(who);
-  if (!c) return -1;
-  if (c->out_path_len == OUT_PATH_UNKNOWN || !mesh::Packet::isValidPathLen(c->out_path_len)) return 0;
-  *hops = c->out_path_len & 63;
-  *hash_sz = (c->out_path_len >> 6) + 1;
-  memcpy(path, c->out_path, (size_t)(*hops) * (*hash_sz));
-  return 1;
-}
-// path == nullptr resets to "unknown" (flood and relearn).
-bool luaHostSetContactRoute(const char* who, const uint8_t* path, int hops, int hash_sz, const char** err) {
-  ContactInfo* c = luaFindContact(who);
-  if (!c) { *err = "no such contact"; return false; }
-  const bool ok = path ? the_mesh.uiSetContactPath(c->id.pub_key, path, (uint8_t)hops, (uint8_t)hash_sz)
-                       : the_mesh.uiResetContactPath(c->id.pub_key);
-  if (!ok) *err = "bad route";
-  return ok;
-}
-// Bytes per hop this node writes into the paths of the floods it sends.
-int luaHostPathHashSize() { return (int)(the_mesh.getNodePrefs()->path_hash_mode) + 1; }
-#endif  // CAP_LUA_SDK_EXT
 
 // type_filter is a bitmask over ADV_TYPE_*; 0 means every node type.
 // Returns the scan tag (non-zero) if the probe went out.
@@ -85888,6 +85722,7 @@ static void sdHealthTick() {
 #endif
 
 void UITask::loop() {
+  pcesServiceEnsure();   // PCES: notices PCES server adverts (PcesApp.h)
   unsigned long now = millis();
 #if defined(HAS_WIO_TRACKER_L2)
   wioL2AudioService();   // amp + codec off once a chime has finished (before any early return)
@@ -87993,6 +87828,7 @@ static const PopupEnt k_popup_registry[] = {
 #endif
   { P_OPEN(s_admin_root),            []{ closeAdminConsole(); },          PF_COUNT },
   { P_OPEN(s_ra_root),               []{ raBack(); },                     PF_COUNT },   // repeater admin app (Back = one page up)
+  { P_OPEN(s_pces_root),             []{ pcesBack(); },                   PF_COUNT },   // PCES route screen
 #if CAP_LUA_APPS
   // The Store page (also where Settings -> Language lands, see luaStoreOpenLanguages)
   // was never registered, so backspace/Esc did nothing on it and the ONLY way out was
