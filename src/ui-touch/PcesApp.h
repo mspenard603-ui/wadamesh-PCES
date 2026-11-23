@@ -64,6 +64,7 @@ static constexpr uint32_t kPcesTraceGapMs   = 15000;   // every hop answers: sam
 static constexpr int      kPcesBenchMax     = 100;     // samples per route, at most
 static const uint8_t  kPcesBenchRounds[]  = { 10, 25, 50, 100 };   // per route
 static const uint8_t  kPcesBenchGapS[]    = { 15, 30, 60 };        // between traces
+static constexpr uint32_t kPcesDiscoverWaitMs = 30000;   // a flooded discovery's reply
 
 enum PcesRun : uint8_t { PRUN_NONE = 0, PRUN_TEST, PRUN_INFO, PRUN_AUTO };
 // What the run waits for / does next.
@@ -140,6 +141,9 @@ struct PcesState {
   uint32_t cmp_next_at, cmp_t0;
   uint8_t  bench_rounds_i, bench_gap_i;  // index into kPcesBenchRounds / kPcesBenchGapS
   char     bench_csv[64];                // the CSV this run appends to ("" = not saved)
+  bool     bench_discovering;            // finding the default path first (flooded discovery)
+  uint32_t bench_disc_deadline;
+  char     bench_msg[120];               // why a benchmark did not start, or what it is doing
   uint8_t  cmp_for[PUB_KEY_SIZE];
   PcesCmpSide cmp[2];                    // 0 = default, 1 = PCES
 };
@@ -744,14 +748,28 @@ void pcesBenchCsvSample(int side, const PcesSample& sm, const char* hops_txt) {
   if (!pcesCsvWrite(s_pces->bench_csv, line, false)) s_pces->bench_csv[0] = 0;   // stop trying
 }
 
-void pcesCompareCb(lv_event_t* e) {
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED || !s_pces) return;
-  ContactInfo* t = pcesTarget();
-  if (!t || s_pces->cmp_active || s_pces->run != PRUN_NONE) return;
+bool pcesSameRoute(const PcesCmpSide& a, const PcesCmpSide& b) {
+  if (a.len != b.len) return false;
+  const int n = (a.len & 63) * ((a.len >> 6) + 1);
+  return memcmp(a.path, b.path, n) == 0;
+}
+// With both routes fixed: start sampling, or say why not.
+void pcesBenchBegin() {
+  ContactInfo* t = the_mesh.lookupContactByPubKey(s_pces->cmp_for, PUB_KEY_SIZE);
   auto& d = s_pces->cmp[0]; auto& p = s_pces->cmp[1];
-  memset(s_pces->cmp, 0, sizeof s_pces->cmp);
-  if (!pcesCmpRoutes(*t, &d.len, d.path, &p.len, p.path)) return;
-  memcpy(s_pces->cmp_for, t->id.pub_key, PUB_KEY_SIZE);
+  s_pces->bench_discovering = false;
+  if (!t) { snprintf(s_pces->bench_msg, sizeof s_pces->bench_msg, "%s", TR("Target is no longer a contact.")); s_pces->dirty = true; return; }
+  if (pcesSameRoute(d, p)) {
+    snprintf(s_pces->bench_msg, sizeof s_pces->bench_msg, "%s", TR("The default path is the PCES route: nothing to compare."));
+    s_pces->dirty = true;
+    return;
+  }
+  if (!pcesIsRelay(*t) && (d.len & 63) == 0) {
+    snprintf(s_pces->bench_msg, sizeof s_pces->bench_msg, "%s", TR("The default path is direct (no relays): a companion does not relay a trace, so there is nothing to sample."));
+    s_pces->dirty = true;
+    return;
+  }
+  s_pces->bench_msg[0] = 0;
   s_pces->cmp_active = true; s_pces->cmp_done = false; s_pces->cmp_waiting = false;
   s_pces->cmp_i = 0;
   s_pces->cmp_t0 = millis();
@@ -761,19 +779,49 @@ void pcesCompareCb(lv_event_t* e) {
   const uint32_t now_s = the_mesh.getRTCClock() ? the_mesh.getRTCClock()->getCurrentTime() : 0;
   snprintf(s_pces->bench_csv, sizeof s_pces->bench_csv, "/pces/bench-%lu.csv", (unsigned long)(now_s ? now_s : millis() / 1000));
   char dr[64], pr[64], head[300];
-  if (pcesFloods(d.len)) pcesFmtRoute(nullptr, -1, 1, dr, sizeof dr); else pcesFmtRoute(d.path, d.len & 63, (d.len >> 6) + 1, dr, sizeof dr);
+  pcesFmtRoute(d.path, d.len & 63, (d.len >> 6) + 1, dr, sizeof dr);
   pcesFmtRoute(p.path, p.len & 63, (p.len >> 6) + 1, pr, sizeof pr);
   snprintf(head, sizeof head,
            "# PCES route benchmark: target=%s, default=%s, pces=%s, rounds=%u per route, gap=%lu s, epoch=%lu\n"
            "seq,ms,route,delivered,rtt_ms,weakest_snr_db,hop_snrs_db\n",
            pcesName(*t), dr, pr, (unsigned)pcesBenchRounds(), (unsigned long)(pcesBenchGapMs() / 1000), (unsigned long)now_s);
   if (!pcesCsvWrite(s_pces->bench_csv, head, true)) s_pces->bench_csv[0] = 0;
+  s_pces->dirty = true;
+}
+// The default side is MeshCore's own fixed path to the target, never a flood. When none
+// is known, find it first with a flooded discovery (MyMesh::uiDiscoverPath): the reply
+// carries the path back, and the target's stored route is left as it was.
+void pcesCompareCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED || !s_pces) return;
+  ContactInfo* t = pcesTarget();
+  if (!t || s_pces->cmp_active || s_pces->bench_discovering || s_pces->run != PRUN_NONE) return;
+  auto& d = s_pces->cmp[0]; auto& p = s_pces->cmp[1];
+  memset(s_pces->cmp, 0, sizeof s_pces->cmp);
+  s_pces->bench_csv[0] = 0;
+  s_pces->cmp_done = false;
+  if (!pcesCmpRoutes(*t, &d.len, d.path, &p.len, p.path)) return;
+  memcpy(s_pces->cmp_for, t->id.pub_key, PUB_KEY_SIZE);
+  if (!pcesFloods(d.len)) { pcesBenchBegin(); pcesRender(); return; }
+  if (the_mesh.hasUIRequestPending()) {
+    snprintf(s_pces->bench_msg, sizeof s_pces->bench_msg, "%s", TR("Another request is in flight. Try again shortly."));
+    pcesRender(); return;
+  }
+  const int r = the_mesh.uiDiscoverPath(*t);
+  if (r != MSG_SEND_SENT_FLOOD && r != MSG_SEND_SENT_DIRECT) {
+    snprintf(s_pces->bench_msg, sizeof s_pces->bench_msg, "%s", TR("Path discovery not sent: radio busy."));
+    pcesRender(); return;
+  }
+  s_pces->bench_discovering = true;
+  s_pces->bench_disc_deadline = millis() + kPcesDiscoverWaitMs;
+  snprintf(s_pces->bench_msg, sizeof s_pces->bench_msg, "%s",
+           TR("No fixed default path: finding the one MeshCore would learn (one flooded discovery)..."));
   pcesRender();
 }
 void pcesCompareStopCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED || !s_pces) return;
   s_pces->cmp_active = false; s_pces->cmp_waiting = false; s_pces->trace_tag = 0;
-  s_pces->cmp_done = true;
+  if (s_pces->bench_discovering) { s_pces->bench_discovering = false; the_mesh.uiCancelPathDiscovery(); s_pces->bench_msg[0] = 0; }
+  else s_pces->cmp_done = true;
   pcesRender();
 }
 void pcesBenchRoundsCb(lv_event_t* e) {
@@ -797,6 +845,19 @@ void pcesBenchMissed() {
 }
 // One step of a benchmark, from the service tick.
 void pcesCompareTick(uint32_t now) {
+  if (s_pces->bench_discovering) {
+    auto& d = s_pces->cmp[0];
+    if (the_mesh.uiTakeDiscoveredPath(&d.len, d.path)) {
+      pcesBenchBegin();
+    } else if ((int32_t)(now - s_pces->bench_disc_deadline) >= 0) {
+      the_mesh.uiCancelPathDiscovery();
+      s_pces->bench_discovering = false;
+      snprintf(s_pces->bench_msg, sizeof s_pces->bench_msg, "%s",
+               TR("Path discovery got no reply in 30 s: no default path to compare with. Not retried."));
+      s_pces->dirty = true;
+    }
+    return;
+  }
   if (!s_pces->cmp_active || s_pces->cmp_waiting) return;
   if (s_pces->cmp_i >= 2u * pcesBenchRounds()) { s_pces->cmp_active = false; s_pces->cmp_done = true; s_pces->dirty = true; return; }
   if ((int32_t)(now - s_pces->cmp_next_at) < 0 || pcesTraceBusy()) return;
@@ -804,8 +865,6 @@ void pcesCompareTick(uint32_t now) {
   if (!t) { s_pces->cmp_active = false; s_pces->cmp_done = true; s_pces->dirty = true; return; }
   const int which = s_pces->cmp_i & 1;
   PcesCmpSide& side = s_pces->cmp[which];
-  // A flooding default has no fixed route to trace: skip its turns, not counted.
-  if (which == 0 && pcesFloods(side.len)) { ++s_pces->cmp_i; s_pces->dirty = true; return; }
   const char* why = nullptr;
   const uint32_t tag = pcesTraceAlong(*t, side.len, side.path, &why);
   ++s_pces->cmp_i;
@@ -1078,10 +1137,13 @@ void pcesRenderMain() {
         char rt[64];
         const uint8_t len = mine ? s_pces->cmp[k].len : (k ? pl : dl);
         const uint8_t* path = mine ? s_pces->cmp[k].path : (k ? pp : dp);
-        if (pcesFloods(len)) pcesFmtRoute(nullptr, -1, 1, rt, sizeof rt);
+        if (pcesFloods(len)) snprintf(rt, sizeof rt, "%s", TR("none fixed: found on Run"));
         else pcesFmtRoute(path, len & 63, (len >> 6) + 1, rt, sizeof rt);
         setInfoRow(cc, names[k], rt);
       }
+      if (s_pces->bench_msg[0] && memcmp(s_pces->cmp_for, t->id.pub_key, PUB_KEY_SIZE) == 0)
+        pcesText(cc, s_pces->bench_msg, &g_font_12, s_pces->bench_discovering ? COLOR_STATUS_INFO : COLOR_STATUS_WARN);
+      if (s_pces->bench_discovering) setButton(cc, UI_ICON_X, "Stop", pcesCompareStopCb, nullptr, SET_DANGER);
       if (mine) {
         namespace PST = PcesStats;   // not "PS": a xtensa register macro
         static double xs[kPcesBenchMax], scratch[kPcesBenchMax];
@@ -1097,7 +1159,7 @@ void pcesRenderMain() {
           // A side still waiting on its last trace counts that one as pending, not lost.
           const int done = c.sent - ((s_pces->cmp_waiting && ((s_pces->cmp_i - 1) & 1) == k) ? 1 : 0);
           double lo, hi; PST::wilson(c.back, done, &lo, &hi);
-          if (done <= 0) { snprintf(buf, sizeof buf, "%s: %s", names[k], k == 0 && pcesFloods(c.len) ? TR("floods, not traced") : TR("no samples yet")); }
+          if (done <= 0) { snprintf(buf, sizeof buf, "%s: %s", names[k], TR("no samples yet")); }
           else snprintf(buf, sizeof buf, TR("%s: delivered %u/%u = %.0f%% (95%% CI %.0f-%.0f%%)"), names[k],
                         (unsigned)c.back, (unsigned)done, 100.0 * c.back / done, 100 * lo, 100 * hi);
           pcesText(cc, buf, &g_font_semi_14, COLOR_TEXT);
@@ -1147,7 +1209,7 @@ void pcesRenderMain() {
           pcesText(cc, buf, &g_font_12, COLOR_SUB);
         }
       }
-      if (!s_pces->cmp_active) {
+      if (!s_pces->cmp_active && !s_pces->bench_discovering) {
         snprintf(buf, sizeof buf, TR("Samples per route: %u"), (unsigned)pcesBenchRounds());
         setButton(cc, UI_ICON_SLIDERS_HORIZONTAL, buf, pcesBenchRoundsCb);
         snprintf(buf, sizeof buf, TR("Gap between traces: %u s"), (unsigned)(pcesBenchGapMs() / 1000));
@@ -1156,9 +1218,10 @@ void pcesRenderMain() {
                  (unsigned)((2u * pcesBenchRounds() * pcesBenchGapMs() / 1000 + 59) / 60));
         setButton(cc, UI_ICON_ACTIVITY, buf, pcesCompareCb, nullptr, SET_PRIMARY);
         if (!mine)
-          setNote(cc, "Traces out along each route and back, alternating, then statistics: delivery rate with "
-                      "a 95% interval, RTT and weakest-hop SNR, and p-values for the differences. Every sample "
-                      "goes to a CSV. Runs with the page closed. Nothing is changed.");
+          setNote(cc, "Compares the PCES route with MeshCore's own fixed path (never a flood); with none known, "
+                      "Run first finds it with one flooded discovery. Then traces along each, alternating, and "
+                      "statistics: delivery rate with a 95% interval, RTT and weakest-hop SNR, p-values for the "
+                      "differences. Every sample goes to a CSV. Runs with the page closed. Nothing is changed.");
       }
     }
   }

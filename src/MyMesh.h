@@ -1271,6 +1271,50 @@ public:
     return false;
   }
 
+  /** PCES benchmark: learn the contact's normal (MeshCore) path without keeping it.
+   *  Sends what MeshCore's own path discovery sends -- a flooded request, whose reply
+   *  comes back as a PATH packet carrying the route to the contact: a blank guest login
+   *  for a repeater / room (they answer requests from logged-in clients only), else a
+   *  flooded base-telemetry request (CMD_SEND_PATH_DISCOVERY_REQ). onContactPathRecv
+   *  captures that path and then puts the contact's stored route back as it was, so a
+   *  route PCES installed (and its pin) survives. Returns the MSG_SEND_* result. */
+  int uiDiscoverPath(ContactInfo& c) {
+    const uint8_t save_len = c.out_path_len;
+    uint8_t save_path[MAX_PATH_SIZE];
+    memcpy(save_path, c.out_path, sizeof save_path);
+    c.out_path_len = OUT_PATH_UNKNOWN;   // send by flood
+    uint32_t tag = 0, est = 0;
+    int r;
+    if (contactNeedsGuestLogin(c)) {
+      r = sendLoginForUI(c, "", est);
+    } else {
+      uint8_t req[9];
+      req[0] = REQ_TYPE_GET_TELEMETRY_DATA;
+      req[1] = ~(TELEM_PERM_BASE);   // base telemetry only
+      memset(&req[2], 0, 3);
+      getRNG()->random(&req[5], 4);  // unique packet hash
+      r = sendRequest(c, req, sizeof req, tag, est);
+    }
+    c.out_path_len = save_len;
+    memcpy(c.out_path, save_path, sizeof save_path);
+    if (r == MSG_SEND_SENT_FLOOD || r == MSG_SEND_SENT_DIRECT) {
+      memcpy(_pd_pub, c.id.pub_key, PUB_KEY_SIZE);
+      _pd_save_len = save_len;
+      memcpy(_pd_save_path, save_path, sizeof _pd_save_path);
+      _pd_armed = true; _pd_done = false;
+    }
+    return r;
+  }
+  /** The path discovery found (raw out_path_len + bytes); false while none yet. */
+  bool uiTakeDiscoveredPath(uint8_t* len, uint8_t* path) {
+    if (!_pd_done) return false;
+    _pd_done = false;
+    *len = _pd_len;
+    memcpy(path, _pd_path, MAX_PATH_SIZE);
+    return true;
+  }
+  void uiCancelPathDiscovery() { _pd_armed = false; _pd_done = false; }
+
   /** Install an explicit out path for a contact (the PCES client applies a route a
    *  path-computation server suggested). `hops`
    *  relays of `hash_sz` bytes each, first hop first, packed into out_path_len the
@@ -1755,6 +1799,11 @@ private:
   uint32_t _pinned[kPinnedMax] = {0};   // uiPinRoute: 4-byte key prefixes, 0 = free
   uint32_t _pinned_fp[kPinnedMax] = {0};   // the pinned route's fingerprint
   uint8_t  _pinned_metric[kPinnedMax] = {0};   // its PCES score, for the contact badge
+  // uiDiscoverPath: the contact asked, its route before, and what came back.
+  bool     _pd_armed = false, _pd_done = false;
+  uint8_t  _pd_pub[PUB_KEY_SIZE] = {0};
+  uint8_t  _pd_save_len = OUT_PATH_UNKNOWN, _pd_save_path[MAX_PATH_SIZE] = {0};
+  uint8_t  _pd_len = 0, _pd_path[MAX_PATH_SIZE] = {0};
   // takePcesAdvert slot.
   bool     _pces_adv_pending = false;
   uint8_t  _pces_adv_pub[PUB_KEY_SIZE] = {0};

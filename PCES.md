@@ -59,8 +59,18 @@ The **Route benchmark (dev)** card appears once PCES has an answer or an install
 route for the target. It measures both routes on air, the same way, over many
 samples:
 
-- **Default** is the route MeshCore had before PCES replaced it, or the stored route
-  when the answer isn't installed. **PCES** is the PCES route.
+- **Default** is MeshCore's own fixed path to the target: the route it had before PCES
+  replaced it, or the stored route when the answer isn't installed. **PCES** is the PCES
+  route. A flood is never benchmarked:
+  - When no fixed default is known, **Run** first finds one with a single flooded path
+    discovery. That's what MeshCore's own path discovery sends: a flooded guest login for
+    a repeater or room, otherwise a flooded base-telemetry request. The path the reply
+    carries back becomes the default. The target's stored route, including an installed
+    PCES route and its pin, is put back as it was.
+  - No reply within 30 s means no default path to compare with. It is not retried.
+  - If the default path is the PCES route, there is nothing to compare, and the card says so.
+  - A companion whose default path is direct (no relays) can't be traced, so there's
+    nothing to sample.
 - **Samples per route** is 10, 25, 50 or 100. **Gap between traces** is 15, 30 or 60 s.
   Traces alternate, default first. The button shows the expected duration (2 × samples
   × gap).
@@ -80,8 +90,7 @@ samples:
   with a commented header (target, both routes, settings), then the columns
   `seq,ms,route,delivered,rtt_ms,weakest_snr_db,hop_snrs_db`.
 - It runs with the page closed, and **Stop benchmark** ends it. Nothing is installed or
-  changed. A default that floods has no fixed route to trace, so only the PCES route
-  is sampled.
+  changed.
 
 The statistics are in `src/helpers/PcesStats.h`, with the host test
 `test/test_pces_stats.cpp`, checked against R's outputs.

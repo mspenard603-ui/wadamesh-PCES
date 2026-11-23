@@ -3883,6 +3883,19 @@ bool MyMesh::onContactPathRecv(ContactInfo& contact, uint8_t* in_path, uint8_t i
       return false;  // DON'T send reciprocal path!
     }
   }
+  // PCES benchmark path discovery (uiDiscoverPath): keep the path this reply brings,
+  // let the base handle the reply as usual, then put the contact's route back.
+  if (_pd_armed && memcmp(contact.id.pub_key, _pd_pub, PUB_KEY_SIZE) == 0 &&
+      mesh::Packet::isValidPathLen(out_path_len)) {
+    _pd_armed = false;
+    memset(_pd_path, 0, sizeof _pd_path);
+    _pd_len = mesh::Packet::copyPath(_pd_path, out_path, out_path_len);
+    _pd_done = true;
+    const bool r = BaseChatMesh::onContactPathRecv(contact, in_path, in_path_len, out_path, out_path_len, extra_type, extra, extra_len);
+    contact.out_path_len = _pd_save_len;
+    memcpy(contact.out_path, _pd_save_path, sizeof contact.out_path);
+    return r;
+  }
   // let base class handle received path and data
   return BaseChatMesh::onContactPathRecv(contact, in_path, in_path_len, out_path, out_path_len, extra_type, extra, extra_len);
 }

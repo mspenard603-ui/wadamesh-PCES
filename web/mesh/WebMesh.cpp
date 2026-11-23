@@ -267,6 +267,27 @@ uint16_t MyMesh::advertFeat1(const uint8_t pub_key[32]) {
   ContactInfo* c = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
   return (c && strcmp(c->name, "Hilltop Repeater") == 0) ? 0xC502 : 0;
 }
+int MyMesh::uiDiscoverPath(ContactInfo& c) {
+  memcpy(_pd_pub, c.id.pub_key, PUB_KEY_SIZE);
+  _pd_armed = true; _pd_at = millis();
+  return MSG_SEND_SENT_FLOOD;
+}
+bool MyMesh::uiTakeDiscoveredPath(uint8_t* len, uint8_t* path) {
+  const char* e = getenv("WADA_DEMO_PCES");
+  if (!_pd_armed || !e || e[0] != '1' || millis() - _pd_at < 2500) return false;
+  _pd_armed = false;
+  ContactInfo* c = lookupContactByPubKey(_pd_pub, PUB_KEY_SIZE);
+  if (!c) return false;
+  memset(path, 0, MAX_PATH_SIZE);
+  const ContactInfo *h = nullptr, *r = nullptr;
+  for (int i = 0; i < _num_contacts; i++) {
+    if (strcmp(_contacts[i].name, "Hilltop Repeater") == 0) h = &_contacts[i];
+    if (strcmp(_contacts[i].name, "Harbor Room") == 0) r = &_contacts[i];
+  }
+  if (h && r) { memcpy(path, h->id.pub_key, 2); memcpy(path + 2, r->id.pub_key, 2); *len = (uint8_t)((1 << 6) | 2); }
+  else { *len = 0; }
+  return true;
+}
 bool MyMesh::takePcesAdvert(uint8_t pub[32], uint8_t hop[3], uint8_t* width, uint8_t* hops) {
   static bool fired = false;
   const char* e = getenv("WADA_DEMO_PCES_ADVERT");

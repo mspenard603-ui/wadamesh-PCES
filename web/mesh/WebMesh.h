@@ -245,6 +245,13 @@ public:
     }
     return false;
   }
+  // PCES benchmark path discovery. The mirror has no flood to learn from: in the demo
+  // (WADA_DEMO_PCES=1) the "discovered" default is the contact's stored route, or for
+  // a contact with none, Hilltop > Harbor hashes; elsewhere nothing comes back.
+  int uiDiscoverPath(ContactInfo& c);
+  bool uiTakeDiscoveredPath(uint8_t* len, uint8_t* path);
+  void uiCancelPathDiscovery() { _pd_armed = false; }
+  bool _pd_armed = false; uint32_t _pd_at = 0; uint8_t _pd_pub[32] = {0};
   uint32_t _pinned[16] = {0}, _pinned_fp[16] = {0};
   uint8_t  _pinned_metric[16] = {0};
   int uiSendAdminCommand(ContactInfo& recipient, const char* text);         // backend CLI line
