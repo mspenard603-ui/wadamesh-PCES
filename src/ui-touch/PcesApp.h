@@ -447,7 +447,7 @@ void pcesInstall(bool backed) {
   slot->backed = backed;
   if (the_mesh.uiSetContactPath(t->id.pub_key, s_pces->route, (uint8_t)s_pces->route_hops, s_pces->plan.width)) {
     the_mesh.uiPinRoute(t->id.pub_key, true);   // a failed Ping or a login must not wipe it
-    contactsListMarkStale();                    // the "PCES path" badge
+    contactsListMarkStale();                    // the "PCES accepted" badge
     pcesLog(SET_TONE_OK, "%s", backed ? TR("4. Accepted and installed (unverified until used). Restore puts the old route back.")
                                       : TR("Installed anyway (unverified). Restore puts the old route back."));
   } else {

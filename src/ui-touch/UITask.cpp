@@ -51282,7 +51282,7 @@ static void refreshContactsList() {
     copyUtf8ReplacingMissingGlyphs(&g_font_semi_14, san, sizeof(san), e.name);
     const lv_coord_t name_full = lv_txt_get_width(san, strlen(san), &g_font_semi_14, 0, LV_TEXT_FLAG_NONE);
     // PCES badges (PcesApp.h): "PCES", outlined, on a repeater or room advertising
-    // Commsol's path service; "PCES path", filled, on a contact whose stored route is
+    // Commsol's path service; "PCES accepted", filled, on a contact whose stored route is
     // the one PCES installed (it goes when MeshCore learns another, or on Restore).
     bool is_pces = false, has_pces_path = false;
     {
@@ -51292,7 +51292,7 @@ static void refreshContactsList() {
         has_pces_path = the_mesh.uiRoutePinned(pc.id.pub_key);
       }
     }
-    static const char kPcesPathTxt[] = "PCES path";
+    static const char kPcesPathTxt[] = "PCES accepted";
     const lv_coord_t pces_w = is_pces
         ? (lv_coord_t)(lv_txt_get_width("PCES", 4, &g_font_semi_12, 0, LV_TEXT_FLAG_NONE) + 12) : 0;
     const lv_coord_t path_w = has_pces_path
