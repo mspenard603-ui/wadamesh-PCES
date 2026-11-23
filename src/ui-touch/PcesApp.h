@@ -42,6 +42,7 @@
 #pragma once
 #include <stdarg.h>
 #include "helpers/PcesProto.h"
+#include "helpers/PcesStats.h"
 
 namespace {
 namespace PP = PcesProto;
@@ -60,7 +61,9 @@ static constexpr int      kPcesLogMax       = 10;
 static constexpr int      kPcesAcceptedMax  = 8;
 static constexpr uint32_t kPcesTraceWaitMs  = 20000;   // out and back along the route
 static constexpr uint32_t kPcesTraceGapMs   = 15000;   // every hop answers: same floor as a Lua ping
-static constexpr uint8_t  kPcesCmpRounds    = 2;       // traces per route in a comparison
+static constexpr int      kPcesBenchMax     = 100;     // samples per route, at most
+static const uint8_t  kPcesBenchRounds[]  = { 10, 25, 50, 100 };   // per route
+static const uint8_t  kPcesBenchGapS[]    = { 15, 30, 60 };        // between traces
 
 enum PcesRun : uint8_t { PRUN_NONE = 0, PRUN_TEST, PRUN_INFO, PRUN_AUTO };
 // What the run waits for / does next.
@@ -80,7 +83,8 @@ struct PcesAccepted {
   uint8_t  new_path[MAX_PATH_SIZE];
 };
 // "Compare routes": the default route vs the PCES route, by traces along each.
-struct PcesCmpSide { uint8_t len; uint8_t path[MAX_PATH_SIZE]; uint8_t sent, back; uint32_t rtt_sum; int8_t weakest4; };
+struct PcesSample { uint16_t rtt_ms; int8_t weakest4; uint8_t ok; };
+struct PcesCmpSide { uint8_t len; uint8_t path[MAX_PATH_SIZE]; uint8_t sent, back; PcesSample s[kPcesBenchMax]; };
 
 struct PcesState {
   bool     open;
@@ -132,8 +136,10 @@ struct PcesState {
   uint8_t  rendered_view;
   // Compare routes.
   bool     cmp_active, cmp_done, cmp_waiting;
-  uint8_t  cmp_i;                        // traces sent so far (even: default, odd: PCES)
-  uint32_t cmp_next_at;
+  uint16_t cmp_i;                        // turns taken so far (even: default, odd: PCES)
+  uint32_t cmp_next_at, cmp_t0;
+  uint8_t  bench_rounds_i, bench_gap_i;  // index into kPcesBenchRounds / kPcesBenchGapS
+  char     bench_csv[64];                // the CSV this run appends to ("" = not saved)
   uint8_t  cmp_for[PUB_KEY_SIZE];
   PcesCmpSide cmp[2];                    // 0 = default, 1 = PCES
 };
@@ -147,6 +153,13 @@ void pcesRender();   // fwd
 void pcesBack();     // fwd
 void pcesInstall(bool backed);   // fwd
 void pcesCompareTick(uint32_t now);   // fwd
+void pcesBenchMissed();              // fwd
+}  // namespace
+// Defined in UITask.cpp beside the UI data filesystem: appends a line to `path` (made
+// relative to the UI data root, directories created); `fresh` truncates first.
+static bool pcesCsvWrite(const char* path, const char* line, bool fresh);
+static void pcesCsvFullPath(const char* rel, char* out, size_t cap);
+namespace {
 
 // ---- small helpers -------------------------------------------------------------------------
 void pcesLog(uint8_t tone, const char* fmt, ...) {
@@ -635,7 +648,7 @@ void pcesTimerCb(lv_timer_t*) {
   }
   if (s_pces->trace_tag && (uint32_t)(now - s_pces->trace_ms) >= kPcesTraceWaitMs) {
     s_pces->trace_tag = 0;
-    if (s_pces->cmp_waiting) { s_pces->cmp_waiting = false; s_pces->dirty = true; }   // not back
+    if (s_pces->cmp_waiting) pcesBenchMissed();   // not back
     else pcesLog(SET_TONE_WARN, "%s", TR("Trace: no reply in 20 s. A hop on this route may not be reachable."));
   }
   pcesCompareTick(now);
@@ -688,10 +701,12 @@ void pcesTraceCb(lv_event_t* e) {
   pcesRender();
 }
 
-// ---- compare routes: the default route vs the PCES route -------------------------------
-// Traces along each, alternating (default first), kPcesCmpRounds each, 15 s apart. Same
-// test both ways: delivered or not, round trip, weakest hop SNR (every hop's reading,
-// out and back). Nothing is installed or changed.
+// ---- benchmark: the default route vs the PCES route (a dev tool) -------------------------
+// Traces along each, alternating (default first), N per route, a fixed gap apart. Same test
+// both ways: delivered or not, round trip, weakest hop SNR (every hop's reading, out and
+// back). Statistics as samples come in (PcesStats.h), every sample appended to a CSV on the
+// UI data filesystem for offline analysis. Nothing is installed or changed. Runs with the
+// page closed; one trace at a time, shared with "Trace route".
 const PcesAccepted* pcesAcceptedFor(const uint8_t* pub) {
   for (const auto& a : s_pces->accepted) if (a.used && memcmp(a.pub, pub, PUB_KEY_SIZE) == 0) return &a;
   return nullptr;
@@ -713,6 +728,22 @@ bool pcesCmpRoutes(const ContactInfo& t, uint8_t* dlen, uint8_t* dpath, uint8_t*
   }
   return false;
 }
+bool pcesFloods(uint8_t len) { return len == OUT_PATH_UNKNOWN || !mesh::Packet::isValidPathLen(len); }
+uint8_t pcesBenchRounds() { return kPcesBenchRounds[s_pces->bench_rounds_i % (sizeof kPcesBenchRounds)]; }
+uint32_t pcesBenchGapMs() { return 1000u * kPcesBenchGapS[s_pces->bench_gap_i % (sizeof kPcesBenchGapS)]; }
+
+void pcesBenchCsvSample(int side, const PcesSample& sm, const char* hops_txt) {
+  if (!s_pces->bench_csv[0]) return;
+  char line[160];
+  if (sm.ok)
+    snprintf(line, sizeof line, "%u,%lu,%s,1,%u,%.2f,%s\n", (unsigned)s_pces->cmp_i, (unsigned long)(millis() - s_pces->cmp_t0),
+             side ? "pces" : "default", (unsigned)sm.rtt_ms, sm.weakest4 / 4.0, hops_txt ? hops_txt : "");
+  else
+    snprintf(line, sizeof line, "%u,%lu,%s,0,,,\n", (unsigned)s_pces->cmp_i, (unsigned long)(millis() - s_pces->cmp_t0),
+             side ? "pces" : "default");
+  if (!pcesCsvWrite(s_pces->bench_csv, line, false)) s_pces->bench_csv[0] = 0;   // stop trying
+}
+
 void pcesCompareCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED || !s_pces) return;
   ContactInfo* t = pcesTarget();
@@ -720,12 +751,23 @@ void pcesCompareCb(lv_event_t* e) {
   auto& d = s_pces->cmp[0]; auto& p = s_pces->cmp[1];
   memset(s_pces->cmp, 0, sizeof s_pces->cmp);
   if (!pcesCmpRoutes(*t, &d.len, d.path, &p.len, p.path)) return;
-  d.weakest4 = p.weakest4 = 127;
   memcpy(s_pces->cmp_for, t->id.pub_key, PUB_KEY_SIZE);
   s_pces->cmp_active = true; s_pces->cmp_done = false; s_pces->cmp_waiting = false;
   s_pces->cmp_i = 0;
+  s_pces->cmp_t0 = millis();
   const uint32_t floor_at = s_pces->trace_last_ms ? s_pces->trace_last_ms + kPcesTraceGapMs : millis();
   s_pces->cmp_next_at = (int32_t)(floor_at - millis()) > 0 ? floor_at : millis();
+  // CSV: /pces/bench-<clock>.csv, a commented header, then one row per sample.
+  const uint32_t now_s = the_mesh.getRTCClock() ? the_mesh.getRTCClock()->getCurrentTime() : 0;
+  snprintf(s_pces->bench_csv, sizeof s_pces->bench_csv, "/pces/bench-%lu.csv", (unsigned long)(now_s ? now_s : millis() / 1000));
+  char dr[64], pr[64], head[300];
+  if (pcesFloods(d.len)) pcesFmtRoute(nullptr, -1, 1, dr, sizeof dr); else pcesFmtRoute(d.path, d.len & 63, (d.len >> 6) + 1, dr, sizeof dr);
+  pcesFmtRoute(p.path, p.len & 63, (p.len >> 6) + 1, pr, sizeof pr);
+  snprintf(head, sizeof head,
+           "# PCES route benchmark: target=%s, default=%s, pces=%s, rounds=%u per route, gap=%lu s, epoch=%lu\n"
+           "seq,ms,route,delivered,rtt_ms,weakest_snr_db,hop_snrs_db\n",
+           pcesName(*t), dr, pr, (unsigned)pcesBenchRounds(), (unsigned long)(pcesBenchGapMs() / 1000), (unsigned long)now_s);
+  if (!pcesCsvWrite(s_pces->bench_csv, head, true)) s_pces->bench_csv[0] = 0;
   pcesRender();
 }
 void pcesCompareStopCb(lv_event_t* e) {
@@ -734,26 +776,42 @@ void pcesCompareStopCb(lv_event_t* e) {
   s_pces->cmp_done = true;
   pcesRender();
 }
-// One step of a comparison, from the service tick.
+void pcesBenchRoundsCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED || !s_pces || s_pces->cmp_active) return;
+  s_pces->bench_rounds_i = (uint8_t)((s_pces->bench_rounds_i + 1) % sizeof kPcesBenchRounds);
+  pcesRender();
+}
+void pcesBenchGapCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED || !s_pces || s_pces->cmp_active) return;
+  s_pces->bench_gap_i = (uint8_t)((s_pces->bench_gap_i + 1) % sizeof kPcesBenchGapS);
+  pcesRender();
+}
+// A trace the benchmark sent got no answer in time.
+void pcesBenchMissed() {
+  PcesCmpSide& side = s_pces->cmp[(s_pces->cmp_i - 1) & 1];
+  PcesSample sm{0, 0, 0};
+  if (side.sent > 0 && side.sent <= kPcesBenchMax) side.s[side.sent - 1] = sm;
+  pcesBenchCsvSample((s_pces->cmp_i - 1) & 1, sm, nullptr);
+  s_pces->cmp_waiting = false;
+  s_pces->dirty = true;
+}
+// One step of a benchmark, from the service tick.
 void pcesCompareTick(uint32_t now) {
   if (!s_pces->cmp_active || s_pces->cmp_waiting) return;
-  if (s_pces->cmp_i >= 2 * kPcesCmpRounds) { s_pces->cmp_active = false; s_pces->cmp_done = true; s_pces->dirty = true; return; }
+  if (s_pces->cmp_i >= 2u * pcesBenchRounds()) { s_pces->cmp_active = false; s_pces->cmp_done = true; s_pces->dirty = true; return; }
   if ((int32_t)(now - s_pces->cmp_next_at) < 0 || pcesTraceBusy()) return;
   ContactInfo* t = the_mesh.lookupContactByPubKey(s_pces->cmp_for, PUB_KEY_SIZE);
   if (!t) { s_pces->cmp_active = false; s_pces->cmp_done = true; s_pces->dirty = true; return; }
-  PcesCmpSide& side = s_pces->cmp[s_pces->cmp_i & 1];
+  const int which = s_pces->cmp_i & 1;
+  PcesCmpSide& side = s_pces->cmp[which];
   // A flooding default has no fixed route to trace: skip its turns, not counted.
-  if ((s_pces->cmp_i & 1) == 0 && (side.len == OUT_PATH_UNKNOWN || !mesh::Packet::isValidPathLen(side.len))) {
-    ++s_pces->cmp_i;
-    s_pces->dirty = true;
-    return;
-  }
+  if (which == 0 && pcesFloods(side.len)) { ++s_pces->cmp_i; s_pces->dirty = true; return; }
   const char* why = nullptr;
   const uint32_t tag = pcesTraceAlong(*t, side.len, side.path, &why);
   ++s_pces->cmp_i;
-  s_pces->cmp_next_at = now + kPcesTraceGapMs;
-  if (!tag) { side.sent++; s_pces->dirty = true; return; }   // counts as not back (e.g. a flood default)
-  side.sent++;
+  s_pces->cmp_next_at = now + pcesBenchGapMs();
+  if (side.sent < kPcesBenchMax) side.sent++;
+  if (!tag) { pcesBenchMissed(); s_pces->cmp_waiting = false; return; }   // not sent counts as not back
   s_pces->trace_tag = tag; s_pces->trace_ms = now; s_pces->trace_last_ms = now;
   s_pces->cmp_waiting = true;
   s_pces->dirty = true;
@@ -763,13 +821,20 @@ bool pcesOnTraceResult(uint32_t tag, int8_t their_snr, int8_t our_snr, uint8_t e
   if (!s_pces || !tag || tag != s_pces->trace_tag) return false;
   s_pces->trace_tag = 0;
   const uint32_t rtt = millis() - s_pces->trace_ms;
-  if (s_pces->cmp_waiting) {   // a comparison trace: just record it
-    PcesCmpSide& side = s_pces->cmp[(s_pces->cmp_i - 1) & 1];
-    side.back++;
-    side.rtt_sum += rtt;
+  if (s_pces->cmp_waiting) {   // a benchmark trace: record the sample
+    const int which = (s_pces->cmp_i - 1) & 1;
+    PcesCmpSide& side = s_pces->cmp[which];
     int8_t w = their_snr < our_snr ? their_snr : our_snr;
-    for (int i = 0; i < extra_hops && extra; ++i) if (extra[i] < w) w = extra[i];
-    if (w < side.weakest4) side.weakest4 = w;
+    char hops[96]; size_t o = snprintf(hops, sizeof hops, "%.2f", their_snr / 4.0);
+    for (int i = 0; i < extra_hops && extra; ++i) {
+      if (extra[i] < w) w = extra[i];
+      if (o < sizeof hops) o += snprintf(hops + o, sizeof hops - o, " %.2f", extra[i] / 4.0);
+    }
+    if (o < sizeof hops) snprintf(hops + o, sizeof hops - o, " %.2f", our_snr / 4.0);
+    PcesSample sm{ (uint16_t)(rtt > 65535 ? 65535 : rtt), w, 1 };
+    if (side.sent > 0 && side.sent <= kPcesBenchMax) side.s[side.sent - 1] = sm;
+    side.back++;
+    pcesBenchCsvSample(which, sm, hops);
     s_pces->cmp_waiting = false;
     s_pces->dirty = true;
     return true;
@@ -1001,56 +1066,99 @@ void pcesRenderMain() {
     setInfoRow(ac, TR("PCES path"), buf);
   }
 
-  // Compare: the default route vs the PCES route.
+  // Benchmark: the default route vs the PCES route.
   if (t) {
     uint8_t dl, dp[MAX_PATH_SIZE], pl, pp[MAX_PATH_SIZE];
     const bool can = pcesCmpRoutes(*t, &dl, dp, &pl, pp);
-    const bool mine = memcmp(s_pces->cmp_for, t->id.pub_key, PUB_KEY_SIZE) == 0;
-    if (can || (mine && (s_pces->cmp_active || s_pces->cmp_done))) {
-      lv_obj_t* cc = setCardIn(s_pces_page, TR("Default route vs PCES route"));
+    const bool mine = memcmp(s_pces->cmp_for, t->id.pub_key, PUB_KEY_SIZE) == 0 && (s_pces->cmp_active || s_pces->cmp_done);
+    if (can || mine) {
+      lv_obj_t* cc = setCardIn(s_pces_page, TR("Route benchmark (dev)"));
       const char* names[2] = { TR("Default"), TR("PCES") };
       for (int k = 0; k < 2; ++k) {
         char rt[64];
-        const uint8_t len = (mine && (s_pces->cmp_active || s_pces->cmp_done)) ? s_pces->cmp[k].len : (k ? pl : dl);
-        const uint8_t* path = (mine && (s_pces->cmp_active || s_pces->cmp_done)) ? s_pces->cmp[k].path : (k ? pp : dp);
-        if (len == OUT_PATH_UNKNOWN || !mesh::Packet::isValidPathLen(len)) pcesFmtRoute(nullptr, -1, 1, rt, sizeof rt);
+        const uint8_t len = mine ? s_pces->cmp[k].len : (k ? pl : dl);
+        const uint8_t* path = mine ? s_pces->cmp[k].path : (k ? pp : dp);
+        if (pcesFloods(len)) pcesFmtRoute(nullptr, -1, 1, rt, sizeof rt);
         else pcesFmtRoute(path, len & 63, (len >> 6) + 1, rt, sizeof rt);
         setInfoRow(cc, names[k], rt);
       }
-      if (mine && (s_pces->cmp_active || s_pces->cmp_done)) {
+      if (mine) {
+        namespace PST = PcesStats;   // not "PS": a xtensa register macro
+        static double xs[kPcesBenchMax], scratch[kPcesBenchMax];
+        PST::Summary rtt[2], snr[2];
         for (int k = 0; k < 2; ++k) {
           const PcesCmpSide& c = s_pces->cmp[k];
-          char w[16];
-          if (c.back) pcesFmtSnr(c.weakest4, w, sizeof w); else snprintf(w, sizeof w, "-");
-          snprintf(buf, sizeof buf, TR("%s: %u/%u traces back, avg %u ms, weakest hop %s"), names[k],
-                   (unsigned)c.back, (unsigned)c.sent, c.back ? (unsigned)(c.rtt_sum / c.back) : 0u, w);
+          int n = 0;
+          for (int i = 0; i < c.sent && i < kPcesBenchMax; ++i) if (c.s[i].ok) xs[n++] = c.s[i].rtt_ms;
+          rtt[k] = PST::summarize(xs, n, scratch);
+          n = 0;
+          for (int i = 0; i < c.sent && i < kPcesBenchMax; ++i) if (c.s[i].ok) xs[n++] = c.s[i].weakest4 / 4.0;
+          snr[k] = PST::summarize(xs, n, scratch);
+          // A side still waiting on its last trace counts that one as pending, not lost.
+          const int done = c.sent - ((s_pces->cmp_waiting && ((s_pces->cmp_i - 1) & 1) == k) ? 1 : 0);
+          double lo, hi; PST::wilson(c.back, done, &lo, &hi);
+          if (done <= 0) { snprintf(buf, sizeof buf, "%s: %s", names[k], k == 0 && pcesFloods(c.len) ? TR("floods, not traced") : TR("no samples yet")); }
+          else snprintf(buf, sizeof buf, TR("%s: delivered %u/%u = %.0f%% (95%% CI %.0f-%.0f%%)"), names[k],
+                        (unsigned)c.back, (unsigned)done, 100.0 * c.back / done, 100 * lo, 100 * hi);
+          pcesText(cc, buf, &g_font_semi_14, COLOR_TEXT);
+          if (rtt[k].n > 0) {
+            snprintf(buf, sizeof buf, TR("  RTT ms: mean %.0f, sd %.0f, median %.0f, p90 %.0f"),
+                     rtt[k].mean, rtt[k].sd, rtt[k].median, rtt[k].p90);
+            pcesText(cc, buf, &g_font_12, COLOR_SUB);
+            snprintf(buf, sizeof buf, TR("  Weakest hop dB: mean %+.2f, sd %.2f, worst %+.2f"),
+                     snr[k].mean, snr[k].sd, snr[k].min);
+            pcesText(cc, buf, &g_font_12, COLOR_SUB);
+          }
+        }
+        // Differences, PCES minus default, with two-sided p.
+        const PcesCmpSide& d = s_pces->cmp[0]; const PcesCmpSide& q = s_pces->cmp[1];
+        const int dn = d.sent - ((s_pces->cmp_waiting && ((s_pces->cmp_i - 1) & 1) == 0) ? 1 : 0);
+        const int qn = q.sent - ((s_pces->cmp_waiting && ((s_pces->cmp_i - 1) & 1) == 1) ? 1 : 0);
+        if (dn > 0 && qn > 0) {
+          double z, t1, t2, df1, df2;
+          const double pd = PST::twoPropP(q.back, qn, d.back, dn, &z);
+          const double ps = PST::welchP(snr[1], snr[0], &t1, &df1);
+          const double pr = PST::welchP(rtt[1], rtt[0], &t2, &df2);
+          auto pfmt = [](double p, char* o, size_t c) { if (isnan(p)) snprintf(o, c, "n/a"); else if (p < 0.001) snprintf(o, c, "<0.001"); else snprintf(o, c, "%.3f", p); };
+          char a[12], b2[12], c2[12];
+          pfmt(pd, a, sizeof a); pfmt(ps, b2, sizeof b2); pfmt(pr, c2, sizeof c2);
+          snprintf(buf, sizeof buf, TR("PCES - default: delivery %+.0f pts (p %s), weakest hop %+.2f dB (p %s), RTT %+.0f ms (p %s)"),
+                   100.0 * ((double)q.back / qn - (double)d.back / dn), a,
+                   (snr[1].n && snr[0].n) ? snr[1].mean - snr[0].mean : 0.0, b2,
+                   (rtt[1].n && rtt[0].n) ? rtt[1].mean - rtt[0].mean : 0.0, c2);
           pcesText(cc, buf, &g_font_12, COLOR_TEXT);
+          // Plain words, only for what is significant at 5%.
+          char sum[160]; size_t o = 0; sum[0] = 0;
+          if (!isnan(pd) && pd < 0.05) o += snprintf(sum + o, sizeof sum - o, "%s", q.back * dn > d.back * qn ? TR("PCES delivers more. ") : TR("Default delivers more. "));
+          if (!isnan(ps) && ps < 0.05 && o < sizeof sum) o += snprintf(sum + o, sizeof sum - o, "%s", snr[1].mean > snr[0].mean ? TR("PCES has the stronger weakest hop. ") : TR("Default has the stronger weakest hop. "));
+          if (!isnan(pr) && pr < 0.05 && o < sizeof sum) o += snprintf(sum + o, sizeof sum - o, "%s", rtt[1].mean < rtt[0].mean ? TR("PCES is faster.") : TR("Default is faster."));
+          if (!sum[0]) snprintf(sum, sizeof sum, "%s", (qn < 10 || dn < 10) ? TR("Too few samples to tell yet.") : TR("No significant difference (p < 0.05) so far."));
+          pcesText(cc, sum, &g_font_semi_14, COLOR_STATUS_OK);
         }
         if (s_pces->cmp_active) {
-          snprintf(buf, sizeof buf, TR("Tracing %u of %u (one every 15 s)..."),
-                   (unsigned)s_pces->cmp_i, (unsigned)(2 * kPcesCmpRounds));
+          snprintf(buf, sizeof buf, TR("Sample %u of %u, one every %lu s..."), (unsigned)s_pces->cmp_i,
+                   (unsigned)(2 * pcesBenchRounds()), (unsigned long)(pcesBenchGapMs() / 1000));
           pcesText(cc, buf, &g_font_12, COLOR_STATUS_INFO);
-          setButton(cc, UI_ICON_X, "Stop comparing", pcesCompareStopCb, nullptr, SET_DANGER);
-        } else {
-          // The verdict: deliveries first, then the weakest hop, then the round trip.
-          const PcesCmpSide& d = s_pces->cmp[0]; const PcesCmpSide& q = s_pces->cmp[1];
-          const char* v;
-          const bool d_floods = d.len == OUT_PATH_UNKNOWN || !mesh::Packet::isValidPathLen(d.len);
-          if (d_floods) v = q.back ? TR("The default floods, so only the PCES route could be traced: it delivered.")
-                                   : TR("The default floods, so only the PCES route could be traced: no trace came back.");
-          else if (q.back != d.back) v = q.back > d.back ? TR("PCES route delivered more traces.") : TR("Default route delivered more traces.");
-          else if (!q.back) v = TR("Neither route brought a trace back.");
-          else if (q.weakest4 - d.weakest4 >= 8) v = TR("PCES route: stronger weakest hop (2 dB or more).");
-          else if (d.weakest4 - q.weakest4 >= 8) v = TR("Default route: stronger weakest hop (2 dB or more).");
-          else v = TR("About even: weakest hops within 2 dB.");
-          pcesText(cc, v, &g_font_semi_14, COLOR_STATUS_OK);
-          setButton(cc, UI_ICON_ACTIVITY, "Compare again", pcesCompareCb);
+          setButton(cc, UI_ICON_X, "Stop benchmark", pcesCompareStopCb, nullptr, SET_DANGER);
         }
-      } else {
-        setButton(cc, UI_ICON_ACTIVITY, "Compare routes", pcesCompareCb, nullptr,
-                  (s_pces->run == PRUN_NONE && !pcesTraceBusy()) ? SET_NORMAL : SET_NORMAL);
-        setNote(cc, "Traces out along each route and back, alternating, 2 each, 15 s apart: how many come back, "
-                    "the round trip, and the weakest hop's SNR. Nothing is changed.");
+        if (s_pces->bench_csv[0]) {
+          char root_path[96]; pcesCsvFullPath(s_pces->bench_csv, root_path, sizeof root_path);
+          snprintf(buf, sizeof buf, TR("Samples saved to %s"), root_path);
+          pcesText(cc, buf, &g_font_12, COLOR_SUB);
+        }
+      }
+      if (!s_pces->cmp_active) {
+        snprintf(buf, sizeof buf, TR("Samples per route: %u"), (unsigned)pcesBenchRounds());
+        setButton(cc, UI_ICON_SLIDERS_HORIZONTAL, buf, pcesBenchRoundsCb);
+        snprintf(buf, sizeof buf, TR("Gap between traces: %u s"), (unsigned)(pcesBenchGapMs() / 1000));
+        setButton(cc, UI_ICON_TIMER, buf, pcesBenchGapCb);
+        snprintf(buf, sizeof buf, TR("Run benchmark (about %u min)"),
+                 (unsigned)((2u * pcesBenchRounds() * pcesBenchGapMs() / 1000 + 59) / 60));
+        setButton(cc, UI_ICON_ACTIVITY, buf, pcesCompareCb, nullptr, SET_PRIMARY);
+        if (!mine)
+          setNote(cc, "Traces out along each route and back, alternating, then statistics: delivery rate with "
+                      "a 95% interval, RTT and weakest-hop SNR, and p-values for the differences. Every sample "
+                      "goes to a CSV. Runs with the page closed. Nothing is changed.");
       }
     }
   }

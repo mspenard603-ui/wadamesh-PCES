@@ -76271,6 +76271,24 @@ static bool uiDataFsReady() {
   return false;
 }
 
+// PCES route benchmark CSV (PcesApp.h): one short append per sample, on the UI data FS
+// (SD-rooted stores prefix /meshcomod).
+static void pcesCsvFullPath(const char* rel, char* out, size_t cap) {
+  snprintf(out, cap, "%s%s", s_ui_data_root, rel ? rel : "");
+}
+static bool pcesCsvWrite(const char* path, const char* line, bool fresh) {
+  if (!uiDataFsReady() || !path || !line) return false;
+  char full[96]; pcesCsvFullPath(path, full, sizeof full);
+  char dir[96]; snprintf(dir, sizeof dir, "%s", full);
+  if (char* slash = strrchr(dir, '/')) { *slash = 0; if (dir[0]) s_ui_data_fs->mkdir(dir); }
+  File f = s_ui_data_fs->open(full, fresh ? "w" : "a");
+  if (!f) return false;
+  const size_t n = strlen(line);
+  const bool ok = f.write((const uint8_t*)line, n) == n;
+  f.close();
+  return ok;
+}
+
 #if CAP_LUA_APPS
 // ---- Lua app host bridges (LuaAppHost.cpp externs) ----
 // The host lives in its own TU; these three shims are its only view of UITask.
@@ -76336,6 +76354,7 @@ fs::FS* luaHostAppFs() { return uiDataFsReady() ? s_ui_data_fs : nullptr; }
 void luaHostAppPath(char* out, size_t cap, const char* rel) {
   snprintf(out, cap, "%s%s", s_ui_data_root, rel);   // SD-rooted stores prefix /meshcomod
 }
+
 
 #if CAP_LUA_IMAGE
 // wada.ui.image: decode a PNG / JPEG / BMP held in memory and fit it inside

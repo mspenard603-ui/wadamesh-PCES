@@ -53,20 +53,38 @@ room target turns the trace itself. A companion doesn't relay traces, so its tra
 turns at its last relay. There is one trace every 15 s, and no reply within 20 s is
 reported.
 
-### Default route vs PCES route
+### Route benchmark (dev tool): default route vs PCES route
 
-**Compare routes** (on the page, once PCES has an answer or an installed route for the
-target) measures both on air, the same way:
+The **Route benchmark (dev)** card appears once PCES has an answer or an installed
+route for the target. It measures both routes on air, the same way, over many
+samples:
+
 - **Default** is the route MeshCore had before PCES replaced it, or the stored route
-  when the answer isn't installed.
-- **PCES** is the PCES route.
+  when the answer isn't installed. **PCES** is the PCES route.
+- **Samples per route** is 10, 25, 50 or 100. **Gap between traces** is 15, 30 or 60 s.
+  Traces alternate, default first. The button shows the expected duration (2 × samples
+  × gap).
+- Each sample is a TRACE out along the route and back. It records delivered or not,
+  the round trip, and the weakest hop's SNR (every hop's reading, out and back).
+- Per route the card shows:
+  - delivery rate with a **Wilson 95% interval**;
+  - RTT mean, SD, median and p90;
+  - weakest-hop SNR mean, SD and worst.
+- Differences are reported as PCES minus default, each with a two-sided p:
+  - delivery: two-proportion z-test;
+  - weakest-hop SNR and RTT: **Welch's t-test**, Student t with Welch-Satterthwaite df.
 
-It sends traces out along each and back, alternating, 2 each, 15 s apart. Each route
-shows how many traces came back, the average round trip, and the weakest hop's SNR
-(every hop's reading, out and back). A verdict follows: deliveries first, then the
-weakest hop (a 2 dB or larger difference), else "about even". Nothing is installed or
-changed. A default that floods has no fixed route to trace, so only the PCES route is
-traced.
+  A plain-language line names only what is significant at p < 0.05.
+- Every sample is appended to `/pces/bench-<epoch>.csv` on the UI data filesystem
+  (internal flash on the T-Deck: **Files > Internal**, or USB Files). The CSV starts
+  with a commented header (target, both routes, settings), then the columns
+  `seq,ms,route,delivered,rtt_ms,weakest_snr_db,hop_snrs_db`.
+- It runs with the page closed, and **Stop benchmark** ends it. Nothing is installed or
+  changed. A default that floods has no fixed route to trace, so only the PCES route
+  is sampled.
+
+The statistics are in `src/helpers/PcesStats.h`, with the host test
+`test/test_pces_stats.cpp`, checked against R's outputs.
 
 ### PCES routes are pinned
 
@@ -123,11 +141,13 @@ spec's worked example.
 
 ## Testing
 
-- **Codec:**
+- **Codec and statistics:**
 
   ```
   c++ -std=c++17 -Wall -Wextra -I src test/test_pces_proto.cpp -o /tmp/t
   /tmp/t
+  c++ -std=c++17 -Wall -Wextra -I src test/test_pces_stats.cpp -o /tmp/s
+  /tmp/s
   ```
 
 - **Simulator:** build with `web/build.sh host`. Each script needs a fresh `WADA_DATA_DIR`. Each script's header gives its exact command and what to expect.
