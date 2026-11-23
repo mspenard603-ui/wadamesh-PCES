@@ -15,7 +15,7 @@ Lua SDK is unchanged.
 
 | Where | What |
 |---|---|
-| App drawer: **PCES** tile | The PCES page. Choose a target, then **Start** a best-path test. |
+| App drawer: **PCES** tile | The PCES page. Choose a target, then tap **Find Best Route**. |
 | Contact action sheet: **PCES route** | The same page, with that contact already the target. |
 | Contacts: **PCES** badge | Repeaters and rooms advertising PCES (feature 1 `0xC5xx`, bit 1). |
 | Contacts: **PCES accepted** badge (filled) | Contacts whose stored route is the one PCES installed. It goes when MeshCore learns a different path, or on Restore / Reset path. |
@@ -25,7 +25,7 @@ Lua SDK is unchanged.
 ## The best-path test
 
 This mirrors the uConsole Console's PCES page (meshcore-uconsole, `meshcore/pces.py`).
-Nothing is sent before **Start**. Each step is logged on the page.
+Nothing is sent before **Find Best Route**. Each step is logged on the page.
 
 1. **First hop R.** Candidates, up to 3:
    - the target's current first hop;
@@ -90,7 +90,7 @@ spec's worked example.
 
 ### On-air etiquette (Commsol spec)
 
-- Requests are sent only on Start, Server info, or a PCES server's advert. Never on a timer or in a loop over contacts.
+- Requests are sent only on Find Best Route, Server info, or a PCES server's advert. Never on a timer or in a loop over contacts.
 - No request is retried. A run tries at most 3 first hops, each once.
 - At most one PCES request every **12 s**, so 5 a minute, matching the server's limit. The login doesn't count towards it.
 - PCES requests share the UI's single-flight request slot with status, telemetry and admin requests and never clobber them.

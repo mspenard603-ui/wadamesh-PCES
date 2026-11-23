@@ -27,7 +27,7 @@
 // the page.
 //
 // On-air etiquette, from the Commsol spec:
-//   * nothing is sent except on Start / Server info, or a PCES server's advert -- never on
+//   * nothing is sent except on Find Best Route / Server info, or a PCES server's advert -- never on
 //     a timer and never in a loop over contacts;
 //   * no request is retried; a run tries at most 3 first hops, each once;
 //   * at most one PCES request every 12 s (the server answers 5 a minute per client).
@@ -358,7 +358,7 @@ void pcesStartTest() {
   } else {
     const uint8_t th = pcesHasPath(*t) ? (uint8_t)(t->out_path_len & 63) : 0;
     if (th == 0) {
-      pcesLog(SET_TONE_WARN, "%s", TR("A companion's route ends at its last relay, and none is known yet. Message it once so the mesh learns one, then Start."));
+      pcesLog(SET_TONE_WARN, "%s", TR("A companion's route ends at its last relay, and none is known yet. Message it once so the mesh learns one, then tap Find Best Route."));
       return;
     }
     memcpy(s_pces->b, t->out_path + (size_t)(th - 1) * s_pces->width, s_pces->width);
@@ -367,7 +367,7 @@ void pcesStartTest() {
   pcesFindFirstHops(*t);
   char hx[12], line[96];
   if (s_pces->n_hops == 0) {
-    pcesLog(SET_TONE_WARN, "%s", TR("1. First hop: no repeater is heard directly. Run Discover (or wait for adverts), then Start."));
+    pcesLog(SET_TONE_WARN, "%s", TR("1. First hop: no repeater is heard directly. Run Discover (or wait for adverts), then tap Find Best Route."));
     return;
   }
   size_t o = snprintf(line, sizeof line, "%s", TR("1. First hop:"));
@@ -868,7 +868,7 @@ void pcesRenderMain() {
   if (t && (pcesIsRelay(*t) || (pcesHasPath(*t) && (t->out_path_len & 63) > 0)))
     setButton(card, UI_ICON_ACTIVITY, s_pces->trace_tag ? "Tracing..." : "Trace route", pcesTraceCb);
   if (running && s_pces->run != PRUN_AUTO) setButton(card, UI_ICON_X, "Stop", pcesStopCb, nullptr, SET_DANGER);
-  else setButton(card, UI_ICON_ROUTE, "Start", pcesStartCb, nullptr, (t && !running) ? SET_PRIMARY : SET_NORMAL);
+  else setButton(card, UI_ICON_ROUTE, "Find Best Route", pcesStartCb, nullptr, (t && !running) ? SET_PRIMARY : SET_NORMAL);
   if (running && s_pces->run == PRUN_AUTO)
     pcesText(card, TR("Asking a PCES server for the path to it (its advert just arrived)..."), &g_font_12, COLOR_SUB);
   for (int i = 0; i < s_pces->n_log; ++i)
@@ -876,7 +876,7 @@ void pcesRenderMain() {
   if (s_pces->can_use_anyway && !running)
     setButton(card, UI_ICON_CHECK, "Use anyway", pcesUseAnywayCb);
   if (!running && s_pces->n_log == 0)
-    setNote(card, "Nothing is sent before Start. A run logs in to the server, asks INFO, then PATH from up to 3 "
+    setNote(card, "Nothing is sent before Find Best Route. A run logs in to the server, asks INFO, then PATH from up to 3 "
                   "first hops (one request every 12 s), and installs the route only if PCES's own data backs it.");
 
   // The last answer, when it is for the target shown.
