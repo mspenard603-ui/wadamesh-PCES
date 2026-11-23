@@ -79889,6 +79889,7 @@ bool UITask::hidesIncomingText(const char* text, bool channel) {
 
 void UITask::onTracePingResult(uint32_t tag, int8_t their_snr, int8_t our_snr,
                                uint8_t extra_hops, const int8_t* extra_snrs) {
+  if (pcesOnTraceResult(tag, their_snr, our_snr, extra_hops, extra_snrs)) return;   // PCES "Trace route"
 #if CAP_LUA_SDK_EXT
   if (tag && tag == s_lua_ping_tag) {   // an app asked: no toast, its on_ping reports it
     s_lua_ping_their = their_snr;

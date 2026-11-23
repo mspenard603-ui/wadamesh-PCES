@@ -58,6 +58,8 @@ static constexpr uint16_t kPcesMaxDataAgeMin = 60;     // MAX_DATA_AGE_MIN
 static constexpr int      kPcesMaxFirstHops = 3;       // MAX_FIRST_HOPS
 static constexpr int      kPcesLogMax       = 10;
 static constexpr int      kPcesAcceptedMax  = 8;
+static constexpr uint32_t kPcesTraceWaitMs  = 20000;   // out and back along the route
+static constexpr uint32_t kPcesTraceGapMs   = 15000;   // every hop answers: same floor as a Lua ping
 
 enum PcesRun : uint8_t { PRUN_NONE = 0, PRUN_TEST, PRUN_INFO, PRUN_AUTO };
 // What the run waits for / does next.
@@ -118,6 +120,11 @@ struct PcesState {
   struct { uint8_t pub4[4]; uint32_t ms; bool used; } asked[8];
   uint8_t  asked_next;
   bool     dirty;
+  // "Trace route": out along the target's route and back, one SNR per hop.
+  uint32_t trace_tag, trace_ms, trace_last_ms;
+  // The page is rebuilt on every update: keep where the user had scrolled to.
+  lv_coord_t keep_scroll;
+  uint8_t  rendered_view;
 };
 PcesState* s_pces = nullptr;   // psAlloc: zero-initialised
 lv_obj_t*  s_pces_root = nullptr;
@@ -246,7 +253,9 @@ void pcesBegin(uint8_t run, ContactInfo* srv, uint8_t next) {
     s_pces->send_at = pcesFloorAt();
     return;
   }
-  const int r = the_mesh.uiSendAdminLogin(*srv, "");   // blank = PCES-only guest at a station
+  // Blank = PCES-only guest at a station. Keeps the stored route: the admin app's login
+  // wipes it first, which would throw away a route PCES itself installed to the server.
+  const int r = the_mesh.uiSendGuestLoginKeepPath(*srv);
   if (r != MSG_SEND_SENT_FLOOD && r != MSG_SEND_SENT_DIRECT) {
     if (run != PRUN_AUTO) pcesLog(SET_TONE_DANGER, "%s", TR("Login not sent: radio busy."));
     pcesEndRun();
@@ -437,6 +446,7 @@ void pcesInstall(bool backed) {
   slot->metric = s_pces->ans.metric;
   slot->backed = backed;
   if (the_mesh.uiSetContactPath(t->id.pub_key, s_pces->route, (uint8_t)s_pces->route_hops, s_pces->plan.width)) {
+    the_mesh.uiPinRoute(t->id.pub_key, true);   // a failed Ping or a login must not wipe it
     pcesLog(SET_TONE_OK, "%s", backed ? TR("4. Accepted and installed (unverified until used). Restore puts the old route back.")
                                       : TR("Installed anyway (unverified). Restore puts the old route back."));
   } else {
@@ -608,8 +618,62 @@ void pcesTimerCb(lv_timer_t*) {
     default:
       break;
   }
+  if (s_pces->trace_tag && (uint32_t)(now - s_pces->trace_ms) >= kPcesTraceWaitMs) {
+    s_pces->trace_tag = 0;
+    pcesLog(SET_TONE_WARN, "%s", TR("Trace: no reply in 20 s. A hop on this route may not be reachable."));
+  }
   if (s_pces->run == PRUN_NONE) pcesAutoTick();
   if (s_pces->dirty) { s_pces->dirty = false; if (s_pces->open) pcesRender(); }
+}
+
+// ---- trace route -----------------------------------------------------------------------------
+// A repeater / room target: out along its route, through it, and back. A companion never
+// relays a trace, so its trace turns at its last relay.
+void pcesTraceCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED || !s_pces) return;
+  ContactInfo* t = pcesTarget();
+  if (!t) return;
+  const uint32_t now = millis();
+  if (s_pces->trace_tag || s_ui_ping_deadline_ms != 0) { pcesLog(SET_TONE_WARN, "%s", TR("A trace or ping is already waiting.")); pcesRender(); return; }
+  if (s_pces->trace_last_ms && (uint32_t)(now - s_pces->trace_last_ms) < kPcesTraceGapMs) {
+    pcesLog(SET_TONE_WARN, TR("Wait %u s: every hop answers a trace."), (unsigned)((kPcesTraceGapMs - (now - s_pces->trace_last_ms) + 999) / 1000));
+    pcesRender(); return;
+  }
+  uint32_t tag = 0;
+  char rt[64];
+  if (pcesIsRelay(*t)) {
+    tag = the_mesh.uiSendTraceRoute(*t);
+    pcesFmtContactRoute(*t, rt, sizeof rt);
+  } else {
+    const uint8_t hops = pcesHasPath(*t) ? (uint8_t)(t->out_path_len & 63) : 0;
+    if (hops == 0) { pcesLog(SET_TONE_WARN, "%s", TR("No route through relays to trace.")); pcesRender(); return; }
+    const uint8_t w = (uint8_t)((t->out_path_len >> 6) + 1);
+    ContactInfo turn = *t;   // the last relay as the turning point, the hops before it as its route
+    memset(turn.id.pub_key, 0, PUB_KEY_SIZE);
+    memcpy(turn.id.pub_key, t->out_path + (size_t)(hops - 1) * w, w);
+    turn.out_path_len = (uint8_t)(((w - 1) << 6) | (hops - 1));
+    tag = the_mesh.uiSendTraceRoute(turn);
+    pcesFmtRoute(t->out_path, hops, w, rt, sizeof rt);
+  }
+  if (!tag) { pcesLog(SET_TONE_DANGER, "%s", TR("Trace not sent: radio busy or route too long.")); pcesRender(); return; }
+  s_pces->trace_tag = tag; s_pces->trace_ms = now; s_pces->trace_last_ms = now;
+  pcesLog(SET_TONE_INFO, TR("Trace: out along %s and back..."), rt);
+  pcesRender();
+}
+bool pcesOnTraceResult(uint32_t tag, int8_t their_snr, int8_t our_snr, uint8_t extra_hops, const int8_t* extra) {
+  if (!s_pces || !tag || tag != s_pces->trace_tag) return false;
+  s_pces->trace_tag = 0;
+  char line[96], v[12];
+  size_t o = snprintf(line, sizeof line, TR("Trace back in %u ms. SNR per hop:"), (unsigned)(millis() - s_pces->trace_ms));
+  pcesFmtSnr(their_snr, v, sizeof v);
+  o += snprintf(line + o, sizeof line - o, " %s", v);
+  for (int i = 0; i < extra_hops && extra && o < sizeof line; ++i) {
+    pcesFmtSnr(extra[i], v, sizeof v);
+    o += snprintf(line + o, sizeof line - o, ", %s", v);
+  }
+  if (o < sizeof line) { pcesFmtSnr(our_snr, v, sizeof v); snprintf(line + o, sizeof line - o, TR(" (us: %s)"), v); }
+  pcesLog(SET_TONE_OK, "%s", line);
+  return true;
 }
 
 // ---- page actions ----------------------------------------------------------------------------
@@ -650,6 +714,7 @@ void pcesRestoreCb(lv_event_t* e) {
     ok = the_mesh.uiResetContactPath(a.pub);
   else
     ok = the_mesh.uiSetContactPath(a.pub, a.old_path, (uint8_t)(a.old_len & 63), (uint8_t)((a.old_len >> 6) + 1));
+  the_mesh.uiPinRoute(a.pub, false);
   a.used = false;
   pcesLogClear();
   pcesLog(ok ? SET_TONE_OK : SET_TONE_DANGER, "%s", ok ? TR("Previous route restored.") : TR("Could not restore: contact gone."));
@@ -720,6 +785,10 @@ uint32_t pcesToneColor(uint8_t tone) {
 }
 
 void pcesNewPage() {
+  // Same view: keep the scroll position across the rebuild; a different view starts at the top.
+  if (s_pces_page && s_pces->rendered_view == s_pces->view) s_pces->keep_scroll = lv_obj_get_scroll_y(s_pces_page);
+  else s_pces->keep_scroll = 0;
+  s_pces->rendered_view = s_pces->view;
   if (s_pces_page) {
     lv_indev_t* a = lv_indev_get_act();
     if (a) lv_indev_wait_release(a);
@@ -767,14 +836,19 @@ void pcesRenderPicker() {
   if (n > 64) setNote(card, "Showing the 64 first contacts. Use PCES route on a contact for any other.");
 }
 
+void pcesRenderMain();
 void pcesRender() {
   if (!s_pces || !s_pces_root) return;
   pcesNewPage();
-  if (s_pces->view == PV_PICK) {
-    pcesRenderPicker();
-    if (g_statusbar.root) lv_obj_move_foreground(g_statusbar.root);
-    return;
+  if (s_pces->view == PV_PICK) pcesRenderPicker();
+  else pcesRenderMain();
+  if (g_statusbar.root) lv_obj_move_foreground(g_statusbar.root);
+  if (s_pces->keep_scroll > 0) {
+    lv_obj_update_layout(s_pces_page);
+    lv_obj_scroll_to_y(s_pces_page, s_pces->keep_scroll, LV_ANIM_OFF);
   }
+}
+void pcesRenderMain() {
   char buf[200];
   const bool running = s_pces->run != PRUN_NONE;
   ContactInfo* t = pcesTarget();
@@ -789,6 +863,8 @@ void pcesRender() {
     setInfoRow(card, TR("Target"), TR("None"));
   }
   setButton(card, UI_ICON_USER, t ? "Change target" : "Choose target", pcesPickTargetCb);
+  if (t && (pcesIsRelay(*t) || (pcesHasPath(*t) && (t->out_path_len & 63) > 0)))
+    setButton(card, UI_ICON_ACTIVITY, s_pces->trace_tag ? "Tracing..." : "Trace route", pcesTraceCb);
   if (running && s_pces->run != PRUN_AUTO) setButton(card, UI_ICON_X, "Stop", pcesStopCb, nullptr, SET_DANGER);
   else setButton(card, UI_ICON_ROUTE, "Start", pcesStartCb, nullptr, (t && !running) ? SET_PRIMARY : SET_NORMAL);
   if (running && s_pces->run == PRUN_AUTO)

@@ -209,6 +209,19 @@ public:
   int sendTelemetryRequestWithGuestLoginForUI(ContactInfo& recipient);
   int uiSendRequestAfterGuestLogin(ContactInfo& recipient, UiReqKind kind);
   int uiSendAdminLogin(ContactInfo& recipient, const char* password);       // backend login (demo: its repeater / room)
+  int uiSendGuestLoginKeepPath(ContactInfo& recipient) { return uiSendAdminLogin(recipient, ""); }   // the mirror resets nothing
+  // PCES-pinned routes: nothing here wipes a route on a failed request, so only the record is kept.
+  void uiPinRoute(const uint8_t pub_key[32], bool pin) {
+    uint32_t pfx; memcpy(&pfx, pub_key, 4);
+    for (auto& p : _pinned) if (p == pfx) { if (!pin) p = 0; return; }
+    if (pin) for (auto& p : _pinned) if (!p) { p = pfx ? pfx : 1; return; }
+  }
+  bool uiRoutePinned(const uint8_t pub_key[32]) const {
+    uint32_t pfx; memcpy(&pfx, pub_key, 4);
+    for (auto p : _pinned) if (p && p == pfx) return true;
+    return false;
+  }
+  uint32_t _pinned[16] = {0};
   int uiSendAdminCommand(ContactInfo& recipient, const char* text);         // backend CLI line
   int uiRoomRelogin(const uint8_t pub_key[32]);
   int sendRegionsRequestForUI(const uint8_t pub_key[PUB_KEY_SIZE], uint32_t& est_timeout);

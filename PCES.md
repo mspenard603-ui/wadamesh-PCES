@@ -46,6 +46,27 @@ use confirms it. MeshCore floods and relearns a route that stops delivering.
 **Accepted PCES routes** lists what was installed, each with **Restore**. The list is
 kept until reboot. **Server info** runs INFO on its own.
 
+**Trace route** (on the page, for the target) sends a TRACE out along the target's
+stored route and back, and logs the SNR at each hop and the round trip. A repeater or
+room target turns the trace itself. A companion doesn't relay traces, so its trace
+turns at its last relay. There is one trace every 15 s, and no reply within 20 s is
+reported.
+
+### PCES routes are pinned
+
+A route PCES installs is **pinned** until you **Restore** it, or until **Reset path**
+on the contact:
+
+- **Ping** sends along it. If no reply comes, it reports "No reply" instead of the
+  usual fallback, which erases the stored route and floods a login to learn a new
+  one.
+- **Logins** (the admin app, room joins, PCES's own guest login) go along it instead
+  of erasing it first. The PCES guest login never erases a route, pinned or not.
+- MeshCore's own path learning is unchanged: if the route stops delivering, a flood
+  still teaches a new one.
+
+Pins live in RAM, like the Restore list.
+
 ### Server
 
 A server you pick is saved in NVS (`pces_srv`) and kept across reboots, even while it
@@ -100,7 +121,7 @@ spec's worked example.
 
 ## Not done in this proof of concept
 
-- No test-send over the new route (it stays "unverified").
+- No automatic test-send over the new route (it stays "unverified"); **Trace route** is the manual test.
 - LINK is encoded and decoded but has no screen.
 - The accepted-routes list, for Restore, lives in RAM only.
 - The target picker lists the 64 most recently heard contacts. For any other, use **PCES route** on the contact.

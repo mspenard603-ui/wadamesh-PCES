@@ -442,6 +442,7 @@ public:
    *  sides before the deferred request or first admin command is sent. */
   void uiResetPathForLogin(ContactInfo& recipient) {
     if (recipient.out_path_len == OUT_PATH_UNKNOWN) return;
+    if (uiRoutePinned(recipient.id.pub_key)) return;   // a PCES route: log in along it
     uiResetContactPath(recipient.id.pub_key);
     recipient.out_path_len = OUT_PATH_UNKNOWN;
     memset(recipient.out_path, 0, sizeof(recipient.out_path));
@@ -476,6 +477,10 @@ public:
     const bool had_path = recipient.out_path_len != OUT_PATH_UNKNOWN;
     const int r = (kind == UiReqKind::Telemetry) ? sendTelemetryRequestForUI(recipient)
                                                  : sendStatusPingForUI(recipient);
+    // Over a pinned PCES route: no fallback login, which would wipe the route and
+    // flood. No reply is reported as no reply (the UI's own deadline).
+    if (had_path && uiRoutePinned(recipient.id.pub_key) &&
+        (r == MSG_SEND_SENT_FLOOD || r == MSG_SEND_SENT_DIRECT)) return r;
     if (r == MSG_SEND_SENT_FLOOD || r == MSG_SEND_SENT_DIRECT) {
       memcpy(_ui_fallback_key, recipient.id.pub_key, PUB_KEY_SIZE);
       _ui_fallback_kind = kind;
@@ -539,6 +544,16 @@ public:
                   recipient.name, (unsigned)recipient.type,
                   (unsigned)(password ? strlen(password) : 0),
                   (unsigned long)recipient.sync_since, r);
+    return r;
+  }
+
+  /** A guest (blank) login that keeps the stored route, for the PCES client: its server
+   *  may carry a route PCES itself installed. The reply comes back through
+   *  onContactResponse's login branch and AbstractUITask::onAdminLoginResult. */
+  int uiSendGuestLoginKeepPath(ContactInfo& recipient) {
+    uint32_t est = 0;
+    int r = sendLoginForUI(recipient, "", est);
+    if (r == MSG_SEND_SENT_FLOOD || r == MSG_SEND_SENT_DIRECT) memcpy(&pending_login, recipient.id.pub_key, 4);
     return r;
   }
 
@@ -1189,14 +1204,39 @@ public:
   bool uiResetContactPath(const uint8_t pub_key[32]) {
     ContactInfo* slot = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
     if (!slot) return false;
+    uiPinRoute(pub_key, false);   // the user reset it: no longer PCES's
     slot->out_path_len = OUT_PATH_UNKNOWN;
     memset(slot->out_path, 0, sizeof(slot->out_path));
     saveContacts();
     return true;
   }
 
-  /** Install an explicit out path for a contact (Lua wada.mesh.set_route, used by
-   *  the PCES app to apply a route a path-computation server suggested). `hops`
+  /** Routes the PCES client installed are "pinned": a Ping that gets no reply, or a
+   *  login, would otherwise wipe the stored path and flood to learn a new one (see
+   *  uiResetPathForLogin, uiSendRequestAfterGuestLogin). A pinned route stays until the
+   *  user restores or resets it; a request over it that gets no answer is reported as
+   *  such. MeshCore's own path learning is untouched: a route that stops delivering is
+   *  still replaced when a flood teaches a new one. RAM only, like PCES's Restore list. */
+  void uiPinRoute(const uint8_t pub_key[PUB_KEY_SIZE], bool pin) {
+    uint32_t pfx; memcpy(&pfx, pub_key, 4);
+    int free_i = -1;
+    for (int i = 0; i < kPinnedMax; ++i) {
+      if (_pinned[i] == pfx) { if (!pin) _pinned[i] = 0; return; }
+      if (!_pinned[i] && free_i < 0) free_i = i;
+    }
+    if (pin) {
+      if (free_i < 0) { memmove(&_pinned[0], &_pinned[1], sizeof(_pinned[0]) * (kPinnedMax - 1)); free_i = kPinnedMax - 1; }
+      _pinned[free_i] = pfx ? pfx : 1;
+    }
+  }
+  bool uiRoutePinned(const uint8_t pub_key[PUB_KEY_SIZE]) const {
+    uint32_t pfx; memcpy(&pfx, pub_key, 4);
+    for (int i = 0; i < kPinnedMax; ++i) if (_pinned[i] && _pinned[i] == pfx) return true;
+    return false;
+  }
+
+  /** Install an explicit out path for a contact (the PCES client applies a route a
+   *  path-computation server suggested). `hops`
    *  relays of `hash_sz` bytes each, first hop first, packed into out_path_len the
    *  way Packet.h does: bits 6-7 = hash size - 1, bits 0-5 = hop count. Zero hops is
    *  a valid "direct" route. Returns false for an unknown contact or a path that does
@@ -1675,6 +1715,8 @@ private:
   uint16_t _feat1_val[kFeat1Slots] = {0};
   bool     _feat1_known[kFeat1Slots] = {false};
   uint8_t  _feat1_next = 0;
+  static const int kPinnedMax = 16;
+  uint32_t _pinned[kPinnedMax] = {0};   // uiPinRoute: 4-byte key prefixes, 0 = free
   // takePcesAdvert slot.
   bool     _pces_adv_pending = false;
   uint8_t  _pces_adv_pub[PUB_KEY_SIZE] = {0};
