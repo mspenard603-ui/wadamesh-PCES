@@ -1,33 +1,28 @@
-# PCES route screen (src/ui-touch/PcesApp.h), web host build, demo backend with a
-# canned PCES station on Hilltop Repeater and a 2-hop route to Diego:
+# PCES best-path test (src/ui-touch/PcesApp.h): the drawer's PCES tile, web host build,
+# demo backend with a canned PCES station on Hilltop Repeater and a 2-hop route to Diego:
 #   WADA_DATA_DIR=$(mktemp -d) WADA_DEMO_PCES=1 web/build-host/wadamesh-host --headless --script web/scripts/pces-route.wada --shots <dir>
 # A fresh data dir starts at first-run setup; the first tap skips it.
-# Expect: pces-1 Hilltop picked because it advertises PCES; pces-2 the same;
-# pces-3 answer 72/100, +6.50 dB, new route BF78 > F733 > 7F33; pces-4 installed with
-# Restore offered; pces-5 back on BF78 > 7F33; pces-6 "Wait N s" (the 12 s floor).
+# Expect: t4 target Diego (BF78 > 7F33), Hilltop picked as server (advertises PCES);
+# t5 steps 1-2 logged (first hop BF78, login, INFO: 42 links, limit -7.50 dB);
+# t6/t7 PATH BF78 > 7F33 after the 12 s floor, 72/100, +6.50 dB, accepted and installed.
 wait 5000
 tap 60 283
 wait 2500
-tap 240 456
-wait 2000
-tap 200 320
+tap 697 360
 wait 1500
-tap 265 316
+tap 621 75
 wait 1500
-shot pces-1-open
-tap 400 296
-wait 1200
-shot pces-2-server
 tap 400 162
-wait 7000
-shot pces-3-answer
-tap 400 413
 wait 1200
-shot pces-4-installed
-tap 400 226
+tap 400 446
 wait 1200
-shot pces-5-restored
-tap 400 162
-wait 800
-shot pces-6-floor
+shot pces-t4-target
+tap 400 262
+wait 6000
+shot pces-t5-info
+wait 14000
+shot pces-t6-done
+drag 400 420 400 100
+wait 1000
+shot pces-t7-scrolled
 quit

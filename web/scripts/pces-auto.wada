@@ -2,7 +2,7 @@
 #   WADA_DATA_DIR=$(mktemp -d) WADA_DEMO_PCES=1 WADA_DEMO_PCES_ADVERT=1 web/build-host/wadamesh-host --headless --script web/scripts/pces-auto.wada --shots <dir>
 # At 8 s a fake advert says Hilltop Repeater is a PCES server heard via Harbor Room.
 # Expect: pces-auto-1 the toast "PCES: route to Hilltop Repeater installed (metric 72)";
-# pces-auto-2 Hilltop's PCES screen: route now = the PCES path, the answer shown.
+# pces-auto-2 the PCES page from Hilltop's action sheet (Hilltop as target, route installed).
 wait 5000
 tap 60 283
 wait 8500

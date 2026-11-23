@@ -1,0 +1,15 @@
+# Contacts "PCES servers" filter and badge, web host build, demo backend:
+#   WADA_DATA_DIR=$(mktemp -d) WADA_DEMO_PCES=1 web/build-host/wadamesh-host --headless --script web/scripts/pces-filter.wada --shots <dir>
+# Expect: pces-f1 the filter sheet with "PCES servers"; pces-f2 only Hilltop Repeater, badged.
+wait 5000
+tap 60 283
+wait 2500
+tap 240 456
+wait 2000
+tap 605 50
+wait 1200
+shot pces-f1-sheet
+tap 400 221
+wait 1500
+shot pces-f2-filtered
+quit
