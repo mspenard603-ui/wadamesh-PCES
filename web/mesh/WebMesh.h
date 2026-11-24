@@ -123,6 +123,9 @@ public:
   // Not mirrored from a real radio; WADA_DEMO_PCES=1 marks the demo's Hilltop Repeater
   // as a PCES server (0xC502) so the contact-list badge and auto-pick can be seen.
   uint16_t advertFeat1(const uint8_t pub_key[32]);
+  uint32_t feat1Generation() const { return 0; }
+  void uiSeedFeat1(const uint8_t*, uint16_t) {}
+  int uiFeat1Markers(uint8_t (*)[4], uint16_t*, int) const { return 0; }
   // No raw adverts reach the browser build. WADA_DEMO_PCES_ADVERT=1 fakes one, 8 s after boot:
   // Hilltop Repeater as a PCES server heard via Harbor Room (web/scripts/pces-auto.wada).
   bool takePcesAdvert(uint8_t pub[32], uint8_t hop[3], uint8_t* width, uint8_t* hops);

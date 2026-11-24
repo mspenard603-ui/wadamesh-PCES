@@ -115,6 +115,9 @@ bool touchPrefsSetWebTrust(const void* buf, size_t len);
 // PCES: the server the user picked (32-byte public key); false = none saved.
 bool touchPrefsGetPcesServer(uint8_t out[32]);
 bool touchPrefsSetPcesServer(const uint8_t* pub32);   // null = forget
+// PCES: opaque state blobs kept across reboots ("pces_acc", "pces_mk"); 0 / false = none.
+size_t touchPrefsGetPcesBlob(const char* key, void* out, size_t cap);
+bool touchPrefsSetPcesBlob(const char* key, const void* buf, size_t len);   // null = forget
 
 /** UI language index (UiLang enum in i18n.h; 0 = English). Read at boot. */
 uint8_t touchPrefsGetUiLang();

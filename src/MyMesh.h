@@ -1674,11 +1674,27 @@ private:
   void rememberFeat1(const uint8_t* pub_key, uint16_t f) {
     uint32_t pfx; memcpy(&pfx, pub_key, 4);
     uint8_t slot = _feat1_next;
+    bool found = false;
     for (uint8_t i = 0; i < kFeat1Slots; ++i)
-      if (_feat1_known[i] && _feat1_pfx[i] == pfx) { slot = i; break; }
-    if (slot == _feat1_next) _feat1_next = (uint8_t)((_feat1_next + 1) % kFeat1Slots);
+      if (_feat1_known[i] && _feat1_pfx[i] == pfx) { slot = i; found = true; break; }
+    if (found && _feat1_val[slot] == f) return;   // nothing new
+    if (!found) _feat1_next = (uint8_t)((_feat1_next + 1) % kFeat1Slots);
     _feat1_pfx[slot] = pfx; _feat1_val[slot] = f; _feat1_known[slot] = true;
+    ++_feat1_gen;   // the UI redraws badges and saves the markers (PcesApp.h)
   }
+public:
+  /** Bumped whenever a node's feature-1 marker changes (PcesApp.h polls it). */
+  uint32_t feat1Generation() const { return _feat1_gen; }
+  /** Seed a marker saved before a reboot (does not bump the generation). */
+  void uiSeedFeat1(const uint8_t pub4[4], uint16_t f) { const uint32_t g = _feat1_gen; rememberFeat1(pub4, f); _feat1_gen = g; }
+  /** The non-zero markers known, for saving: up to max (4-byte prefix, word) pairs. */
+  int uiFeat1Markers(uint8_t (*pub4)[4], uint16_t* f, int max) const {
+    int n = 0;
+    for (uint8_t i = 0; i < kFeat1Slots && n < max; ++i)
+      if (_feat1_known[i] && _feat1_val[i]) { memcpy(pub4[n], &_feat1_pfx[i], 4); f[n] = _feat1_val[i]; ++n; }
+    return n;
+  }
+private:
 
   bool putBlobByKey(const uint8_t key[], int key_len, const uint8_t src_buf[], int len) override {
     if (key_len >= 4) {
@@ -1795,6 +1811,7 @@ private:
   uint16_t _feat1_val[kFeat1Slots] = {0};
   bool     _feat1_known[kFeat1Slots] = {false};
   uint8_t  _feat1_next = 0;
+  uint32_t _feat1_gen = 0;
   static const int kPinnedMax = 16;
   uint32_t _pinned[kPinnedMax] = {0};   // uiPinRoute: 4-byte key prefixes, 0 = free
   uint32_t _pinned_fp[kPinnedMax] = {0};   // the pinned route's fingerprint

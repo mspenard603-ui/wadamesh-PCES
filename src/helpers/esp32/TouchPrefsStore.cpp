@@ -982,6 +982,26 @@ bool touchPrefsSetPcesServer(const uint8_t* pub32) {   // null = forget
   return ok;
 }
 
+// PCES client state that should survive a reboot (src/ui-touch/PcesApp.h): accepted
+// routes ("pces_acc") and the PCES server markers heard ("pces_mk"). Opaque blobs;
+// the reader checks their version and size.
+size_t touchPrefsGetPcesBlob(const char* key, void* out, size_t cap) {
+  if (!s_begun) touchPrefsBegin();
+  if (!key || !out || cap == 0 || !s_prefs.isKey(key)) return 0;
+  return s_prefs.getBytes(key, out, cap);
+}
+bool touchPrefsSetPcesBlob(const char* key, const void* buf, size_t len) {
+  if (!key) return false;
+  s_prefs.end();
+  if (!s_prefs.begin(TOUCH_NS, false)) return false;
+  bool ok;
+  if (!buf || len == 0) { s_prefs.remove(key); ok = true; }
+  else ok = s_prefs.putBytes(key, buf, len) == len;
+  s_prefs.end();
+  s_begun = s_prefs.begin(TOUCH_NS, true);
+  return ok;
+}
+
 bool touchPrefsGetMapTileDebug() {
   if (!s_begun) touchPrefsBegin();
   return s_cfg.map_tile_debug != 0;

@@ -141,6 +141,9 @@ struct PcesState {
   uint32_t cmp_next_at, cmp_t0;
   uint8_t  bench_rounds_i, bench_gap_i;  // index into kPcesBenchRounds / kPcesBenchGapS
   char     bench_csv[64];                // the CSV this run appends to ("" = not saved)
+  bool     state_loaded;                 // accepted routes + markers restored after boot
+  uint32_t seen_feat1_gen, marks_saved_ms;
+  bool     marks_dirty;
   bool     bench_discovering;            // finding the default path first (flooded discovery)
   uint32_t bench_disc_deadline;
   char     bench_msg[120];               // why a benchmark did not start, or what it is doing
@@ -158,6 +161,7 @@ void pcesBack();     // fwd
 void pcesInstall(bool backed);   // fwd
 void pcesCompareTick(uint32_t now);   // fwd
 void pcesBenchMissed();              // fwd
+void pcesBadgesChanged();            // fwd
 }  // namespace
 // Defined in UITask.cpp beside the UI data filesystem: appends a line to `path` (made
 // relative to the UI data root, directories created); `fresh` truncates first.
@@ -256,6 +260,62 @@ void pcesFindServer() {
       return;
     }
   }
+}
+
+// A badge changed: rebuild Contacts now (if it is the open tab), not at the next 60 s
+// refresh -- the stale flag alone only takes effect on the next rebuild.
+void pcesBadgesChanged() {
+  contactsListMarkStale();
+  g_lv.dirty_contacts = true;
+}
+
+// ---- kept across reboots ---------------------------------------------------------------------
+// Accepted routes (for Restore, the score badge and the benchmark) and the PCES server
+// markers heard, in NVS. After a reboot a route PCES installed is pinned again only if
+// it is still the contact's stored route.
+static constexpr uint8_t kPcesAccVer = 1, kPcesMarkMax = 16;
+struct PcesAccBlob { uint8_t ver, n; PcesAccepted e[kPcesAcceptedMax]; };
+struct PcesMarkBlob { uint8_t ver, n; uint8_t pub4[kPcesMarkMax][4]; uint16_t f[kPcesMarkMax]; };
+void pcesSaveAccepted() {
+#if defined(ESP32)
+  static PcesAccBlob b;
+  memset(&b, 0, sizeof b);
+  b.ver = kPcesAccVer;
+  for (const auto& a : s_pces->accepted) if (a.used) b.e[b.n++] = a;
+  touchPrefsSetPcesBlob("pces_acc", b.n ? &b : nullptr, b.n ? sizeof b : 0);
+#endif
+}
+void pcesSaveMarks() {
+#if defined(ESP32)
+  PcesMarkBlob b;
+  memset(&b, 0, sizeof b);
+  b.ver = kPcesAccVer;
+  b.n = (uint8_t)the_mesh.uiFeat1Markers(b.pub4, b.f, kPcesMarkMax);
+  touchPrefsSetPcesBlob("pces_mk", b.n ? &b : nullptr, b.n ? sizeof b : 0);
+#endif
+}
+void pcesLoadState() {
+  if (s_pces->state_loaded) return;
+  s_pces->state_loaded = true;
+#if defined(ESP32)
+  static PcesAccBlob b;
+  if (touchPrefsGetPcesBlob("pces_acc", &b, sizeof b) == sizeof b && b.ver == kPcesAccVer && b.n <= kPcesAcceptedMax) {
+    for (int i = 0; i < b.n; ++i) {
+      s_pces->accepted[i] = b.e[i];
+      s_pces->accepted[i].used = true;
+      // Pin again if the contact still has the route PCES gave it.
+      ContactInfo* c = the_mesh.lookupContactByPubKey(b.e[i].pub, PUB_KEY_SIZE);
+      if (c && c->out_path_len == b.e[i].new_len &&
+          memcmp(c->out_path, b.e[i].new_path, (size_t)(b.e[i].new_len & 63) * ((b.e[i].new_len >> 6) + 1)) == 0)
+        the_mesh.uiPinRoute(c->id.pub_key, true, b.e[i].metric);
+    }
+  }
+  PcesMarkBlob m;
+  if (touchPrefsGetPcesBlob("pces_mk", &m, sizeof m) == sizeof m && m.ver == kPcesAccVer && m.n <= kPcesMarkMax)
+    for (int i = 0; i < m.n; ++i) the_mesh.uiSeedFeat1(m.pub4[i], m.f[i]);
+#endif
+  s_pces->seen_feat1_gen = the_mesh.feat1Generation();
+  pcesBadgesChanged();   // badges from the restored state
 }
 
 // ---- the request engine --------------------------------------------------------------------
@@ -478,7 +538,8 @@ void pcesInstall(bool backed) {
     slot->new_len = t->out_path_len;
     memcpy(slot->new_path, t->out_path, sizeof slot->new_path);
     the_mesh.uiPinRoute(t->id.pub_key, true, s_pces->ans.metric);   // a failed Ping or a login must not wipe it
-    contactsListMarkStale();                    // the "PCES <score>" badge
+    pcesSaveAccepted();
+    pcesBadgesChanged();                    // the "PCES <score>" badge
     pcesLog(SET_TONE_OK, "%s", backed ? TR("4. Accepted and installed (unverified until used). Restore puts the old route back.")
                                       : TR("Installed anyway (unverified). Restore puts the old route back."));
   } else {
@@ -611,6 +672,19 @@ bool pcesOnBinaryReply(const ContactInfo& contact, const uint8_t* data, size_t l
 void pcesTimerCb(lv_timer_t*) {
   if (!s_pces) return;
   const uint32_t now = millis();
+  pcesLoadState();
+  // A PCES marker appeared or changed (an advert): redraw the badges now, and save the
+  // markers -- at most once a minute, they only change when a node changes its advert.
+  if (the_mesh.feat1Generation() != s_pces->seen_feat1_gen) {
+    s_pces->seen_feat1_gen = the_mesh.feat1Generation();
+    pcesBadgesChanged();
+    s_pces->marks_dirty = true;
+    if (s_pces->open) s_pces->dirty = true;
+  }
+  if (s_pces->marks_dirty && (uint32_t)(now - s_pces->marks_saved_ms) > 60000u) {
+    s_pces->marks_dirty = false; s_pces->marks_saved_ms = now;
+    pcesSaveMarks();
+  }
   switch (s_pces->step) {
     case PST_LOGIN_WAIT:
     case PST_INFO_WAIT:
@@ -950,7 +1024,8 @@ void pcesRestoreCb(lv_event_t* e) {
   else
     ok = the_mesh.uiSetContactPath(a.pub, a.old_path, (uint8_t)(a.old_len & 63), (uint8_t)((a.old_len >> 6) + 1));
   the_mesh.uiPinRoute(a.pub, false);
-  contactsListMarkStale();
+  pcesBadgesChanged();
+  pcesSaveAccepted();
   a.used = false;
   pcesLogClear();
   pcesLog(ok ? SET_TONE_OK : SET_TONE_DANGER, "%s", ok ? TR("Previous route restored.") : TR("Could not restore: contact gone."));
@@ -1130,6 +1205,15 @@ void pcesRenderMain() {
     uint8_t dl, dp[MAX_PATH_SIZE], pl, pp[MAX_PATH_SIZE];
     const bool can = pcesCmpRoutes(*t, &dl, dp, &pl, pp);
     const bool mine = memcmp(s_pces->cmp_for, t->id.pub_key, PUB_KEY_SIZE) == 0 && (s_pces->cmp_active || s_pces->cmp_done);
+    if (!can && !mine) {
+      // Always shown for a target, so the tool is findable: what it needs first.
+      lv_obj_t* cc = setCardIn(s_pces_page, TR("Route benchmark (dev)"));
+      pcesFmtContactRoute(*t, buf, sizeof buf);
+      setInfoRow(cc, TR("Default"), pcesHasPath(*t) ? buf : TR("none fixed: found on Run"));
+      setInfoRow(cc, TR("PCES"), TR("none yet"));
+      setNote(cc, "Needs a PCES route for this target first: tap Find Best Route above. The benchmark then "
+                  "compares it with MeshCore's own fixed path over many traces.");
+    }
     if (can || mine) {
       lv_obj_t* cc = setCardIn(s_pces_page, TR("Route benchmark (dev)"));
       const char* names[2] = { TR("Default"), TR("PCES") };

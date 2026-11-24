@@ -53,10 +53,21 @@ room target turns the trace itself. A companion doesn't relay traces, so its tra
 turns at its last relay. There is one trace every 15 s, and no reply within 20 s is
 reported.
 
+### Kept across reboots
+
+These survive a reboot, stored in NVS:
+- the saved server (`pces_srv`);
+- the accepted PCES routes (`pces_acc`), for Restore, the score badge and the benchmark;
+- the PCES server markers heard (`pces_mk`), for the badge and filter before the next advert.
+
+After a reboot, a route PCES installed is pinned again only if it is still the contact's
+stored route. Badges redraw as soon as a marker or an accepted route changes; they don't
+wait for the contact list's periodic refresh.
+
 ### Route benchmark (dev tool): default route vs PCES route
 
-The **Route benchmark (dev)** card appears once PCES has an answer or an installed
-route for the target. It measures both routes on air, the same way, over many
+The **Route benchmark (dev)** card is always shown for a target. Until PCES has an
+answer or an installed route for it, the card says to tap **Find Best Route** first. It measures both routes on air, the same way, over many
 samples:
 
 - **Default** is MeshCore's own fixed path to the target: the route it had before PCES
@@ -109,7 +120,7 @@ the score badge goes) once MeshCore stores a different path:
 - MeshCore's own path learning is unchanged: if the route stops delivering, a flood
   still teaches a new one.
 
-Pins live in RAM, like the Restore list.
+Pins are rebuilt from the saved accepted routes after a reboot.
 
 ### Server
 
@@ -169,5 +180,4 @@ spec's worked example.
 
 - No automatic test-send over the new route (it stays "unverified"); **Trace route** is the manual test.
 - LINK is encoded and decoded but has no screen.
-- The accepted-routes list, for Restore, lives in RAM only.
 - The target picker lists the 64 most recently heard contacts. For any other, use **PCES route** on the contact.
