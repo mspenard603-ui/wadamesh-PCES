@@ -19,7 +19,7 @@ Lua SDK is unchanged.
 | Contact action sheet: **PCES route** | The same page, with that contact already the target. |
 | Contacts: **PCES** badge | Repeaters and rooms advertising PCES (feature 1 `0xC5xx`, bit 1). |
 | Contacts: **PCES 72** badge (filled; the accepted route's score) | Contacts whose stored route is the one PCES installed. It goes when MeshCore learns a different path, or on Restore / Reset path. |
-| Contacts filter: **PCES servers** | Only those. |
+| Contacts filter: **PCES servers** | Only those, plus your saved server even if its station sends no marker. |
 | In the background | Asks a PCES server for the best path to itself when its advert arrives (see below). |
 
 ## The best-path test
@@ -59,6 +59,10 @@ These survive a reboot, stored in NVS:
 - the saved server (`pces_srv`);
 - the accepted PCES routes (`pces_acc`), for Restore, the score badge and the benchmark;
 - the PCES server markers heard (`pces_mk`), for the badge and filter before the next advert.
+
+- the saved server's name and type (`pces_si`). If the saved server is missing from
+  contacts after a reboot (auto-purge, or anything else), it's added back from these at
+  boot, and its next advert refreshes it.
 
 After a reboot, a route PCES installed is pinned again only if it is still the contact's
 stored route. Badges redraw as soon as a marker or an accepted route changes; they don't
@@ -123,6 +127,19 @@ the score badge goes) once MeshCore stores a different path:
 Pins are rebuilt from the saved accepted routes after a reboot.
 
 ### Server
+
+**Server check** (on the page, under the server) shows what this device knows about it:
+- its contact key and type;
+- its advertised name (a contact with no name isn't kept at reboot);
+- the PCES marker last heard (or none since boot);
+- when it was last updated, and its advert clock against ours;
+- whether it's a favourite, with **Keep it (favourite)** (favourites are never
+  auto-purged or evicted);
+- the auto-purge setting.
+
+The Commsol station only sends the marker when `repeater.advert_feature1` is set to
+0xC502 (openhop-advert-features.patch). With it unset, there is no marker, so no badge
+and no filter match. The saved server still works.
 
 A server you pick is saved in NVS (`pces_srv`) and kept across reboots, even while it
 is out of contacts. **Clear saved server** forgets it. With nothing saved, the page

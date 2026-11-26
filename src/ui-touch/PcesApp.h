@@ -142,6 +142,8 @@ struct PcesState {
   uint8_t  bench_rounds_i, bench_gap_i;  // index into kPcesBenchRounds / kPcesBenchGapS
   char     bench_csv[64];                // the CSV this run appends to ("" = not saved)
   bool     state_loaded;                 // accepted routes + markers restored after boot
+  bool     server_readded;               // the saved server was put back into contacts
+  bool     server_info_ok;               // its name/type are stored with it
   uint32_t seen_feat1_gen, marks_saved_ms;
   bool     marks_dirty;
   bool     bench_discovering;            // finding the default path first (flooded discovery)
@@ -229,19 +231,51 @@ void pcesLoadSaved() {
   }
 #endif
 }
+// With the saved key: the server's type and name, so a server that has fallen out of
+// the contact table (purged, or lost) can be put back and used at once.
+struct PcesServerInfo { uint8_t ver; uint8_t pub[PUB_KEY_SIZE]; uint8_t type; char name[32]; };
 void pcesSaveServer(const uint8_t* pub) {   // null = forget
 #if defined(ESP32)
   touchPrefsSetPcesServer(pub);
+  ContactInfo* c = pub ? the_mesh.lookupContactByPubKey(pub, PUB_KEY_SIZE) : nullptr;
+  if (c) {
+    PcesServerInfo si; memset(&si, 0, sizeof si);
+    si.ver = 1; memcpy(si.pub, c->id.pub_key, PUB_KEY_SIZE); si.type = c->type;
+    snprintf(si.name, sizeof si.name, "%s", c->name);
+    touchPrefsSetPcesBlob("pces_si", &si, sizeof si);
+  } else if (!pub) {
+    touchPrefsSetPcesBlob("pces_si", nullptr, 0);
+  }
 #else
   (void)pub;
 #endif
   s_pces->server_saved = pub != nullptr;
+}
+// The saved server is missing from contacts: add it back from what was saved with it
+// (once per boot). Its next advert refreshes it as usual.
+bool pcesReaddSavedServer() {
+#if defined(ESP32)
+  static bool tried = false;
+  if (tried || !s_pces->server_saved || pcesServer()) return false;
+  tried = true;
+  PcesServerInfo si;
+  if (touchPrefsGetPcesBlob("pces_si", &si, sizeof si) != sizeof si || si.ver != 1 ||
+      memcmp(si.pub, s_pces->server, PUB_KEY_SIZE) != 0 || !si.name[0]) return false;
+  si.name[sizeof si.name - 1] = 0;
+  if (!the_mesh.uiAddDiscoveredContact(si.pub, si.type ? si.type : ADV_TYPE_REPEATER, si.name)) return false;
+  s_pces->server_readded = true;
+  pcesBadgesChanged();
+  return true;
+#else
+  return false;
+#endif
 }
 // The saved server if there is one (even while it is not a contact: the user chose
 // it), else the first contact advertising "answers PCES".
 void pcesFindServer() {
   pcesLoadSaved();
   if (s_pces->server_saved) {
+    pcesReaddSavedServer();
     s_pces->server_marked = PP::answersPces(the_mesh.advertFeat1(s_pces->server));
     return;
   }
@@ -267,6 +301,12 @@ void pcesFindServer() {
 void pcesBadgesChanged() {
   contactsListMarkStale();
   g_lv.dirty_contacts = true;
+}
+
+// The Contacts "PCES servers" filter: advertised servers, plus the one the user saved
+// (its station may not send the marker).
+bool pcesIsSavedServer(const uint8_t* pub) {
+  return s_pces && s_pces->server_saved && memcmp(pub, s_pces->server, PUB_KEY_SIZE) == 0;
 }
 
 // ---- kept across reboots ---------------------------------------------------------------------
@@ -315,6 +355,9 @@ void pcesLoadState() {
     for (int i = 0; i < m.n; ++i) the_mesh.uiSeedFeat1(m.pub4[i], m.f[i]);
 #endif
   s_pces->seen_feat1_gen = the_mesh.feat1Generation();
+  // The saved server missing from contacts after the reboot: put it back now, not only
+  // when the PCES page is opened, so Contacts and its filter show it.
+  if (s_pces->server_saved && !pcesServer()) pcesReaddSavedServer();
   pcesBadgesChanged();   // badges from the restored state
 }
 
@@ -673,6 +716,17 @@ void pcesTimerCb(lv_timer_t*) {
   if (!s_pces) return;
   const uint32_t now = millis();
   pcesLoadState();
+#if defined(ESP32)
+  // A server saved by an older build has no name/type stored with it: add them once the
+  // contact is there, so it can be put back later if it goes missing.
+  if (s_pces->server_saved && !s_pces->server_info_ok) {
+    PcesServerInfo si;
+    const bool have = touchPrefsGetPcesBlob("pces_si", &si, sizeof si) == sizeof si && si.ver == 1 &&
+                      memcmp(si.pub, s_pces->server, PUB_KEY_SIZE) == 0;
+    if (have) s_pces->server_info_ok = true;
+    else if (pcesServer()) { pcesSaveServer(s_pces->server); s_pces->server_info_ok = true; }
+  }
+#endif
   // A PCES marker appeared or changed (an advert): redraw the badges now, and save the
   // markers -- at most once a minute, they only change when a node changes its advert.
   if (the_mesh.feat1Generation() != s_pces->seen_feat1_gen) {
@@ -1053,6 +1107,23 @@ void pcesForgetServerCb(lv_event_t* e) {
                                                    : TR("Saved server cleared."));
   pcesRender();
 }
+void pcesKeepServerCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED || !s_pces) return;
+  ContactInfo* srv = pcesServer();
+  if (!srv) return;
+#if defined(ESP32)
+  if (touchPrefsSetFavorite(srv->id.pub_key, true)) {
+    the_mesh.uiSetContactFavorite(srv->id.pub_key, true);   // never purged or evicted
+    pcesLogClear();
+    pcesLog(SET_TONE_OK, "%s", TR("Server is now a favourite: auto-purge and a full table never remove it."));
+    pcesBadgesChanged();
+  } else {
+    pcesLogClear();
+    pcesLog(SET_TONE_WARN, "%s", TR("Favourites are full."));
+  }
+#endif
+  pcesRender();
+}
 void pcesPickTargetCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED || !s_pces) return;
   s_pces->view = PV_PICK;
@@ -1323,6 +1394,45 @@ void pcesRenderMain() {
     setInfoRow(sc, TR("Chosen"), s_pces->server_saved ? TR("Saved by you") : TR("Advertises PCES"));
     setButton(sc, UI_ICON_INFO, "Server info", pcesInfoCb);
     if (s_pces->server_saved) setButton(sc, UI_ICON_TRASH_2, "Clear saved server", pcesForgetServerCb, nullptr, SET_DANGER);
+    // Server check: what this device knows about the server, to see why a badge, the
+    // filter or the contact itself might go missing.
+    {
+      lv_obj_t* dc = setCardIn(s_pces_page, TR("Server check"));
+      char hx[12]; pcesHex(srv->id.pub_key, 4, hx, sizeof hx);
+      snprintf(buf, sizeof buf, "%s, %s", hx, srv->type == ADV_TYPE_REPEATER ? TR("repeater") : srv->type == ADV_TYPE_ROOM ? TR("room") : TR("other type"));
+      setInfoRow(dc, TR("Contact"), buf);
+      setInfoRow(dc, TR("Advertised name"), srv->name[0] ? srv->name : TR("(none: not kept at reboot)"));
+      const uint16_t f1 = the_mesh.advertFeat1(srv->id.pub_key);
+      if (f1) snprintf(buf, sizeof buf, "0x%04X%s", (unsigned)f1, PP::answersPces(f1) ? "" : TR(" (no PCES bit)"));
+      else snprintf(buf, sizeof buf, "%s", TR("not heard (none in adverts since boot)"));
+      setInfoRow(dc, TR("PCES marker"), buf);
+      const uint32_t now_s = the_mesh.getRTCClock() ? the_mesh.getRTCClock()->getCurrentTime() : 0;
+      if (srv->lastmod && now_s >= srv->lastmod) {
+        const uint32_t a = now_s - srv->lastmod;
+        if (a < 3600) snprintf(buf, sizeof buf, TR("%lu min ago"), (unsigned long)(a / 60));
+        else if (a < 172800) snprintf(buf, sizeof buf, TR("%lu h ago"), (unsigned long)(a / 3600));
+        else snprintf(buf, sizeof buf, TR("%lu days ago"), (unsigned long)(a / 86400));
+      } else {
+        snprintf(buf, sizeof buf, "%s", TR("unknown"));
+      }
+      setInfoRow(dc, TR("Last update"), buf);
+      if (srv->last_advert_timestamp && now_s) {
+        const long skew = (long)srv->last_advert_timestamp - (long)srv->lastmod;
+        if (labs(skew) < 300) snprintf(buf, sizeof buf, "%s", TR("matches ours"));
+        else snprintf(buf, sizeof buf, TR("%+ld min vs ours"), skew / 60);
+        setInfoRow(dc, TR("Its advert clock"), buf);
+      }
+#if defined(ESP32)
+      const bool fav = touchPrefsIsFavorite(srv->id.pub_key);
+      setInfoRow(dc, TR("Favourite"), fav ? TR("yes") : TR("no"));
+      if (touchPrefsGetContactPurge()) snprintf(buf, sizeof buf, TR("on, %u days"), (unsigned)touchPrefsGetContactPurgeDays());
+      else snprintf(buf, sizeof buf, "%s", TR("off"));
+      setInfoRow(dc, TR("Auto-purge"), buf);
+      if (s_pces->server_readded)
+        setNote(dc, "It was missing from contacts after the reboot and has been added back from the saved server.", SET_TONE_WARN);
+      if (!fav) setButton(dc, UI_ICON_STAR, "Keep it (favourite)", pcesKeepServerCb);
+#endif
+    }
   } else if (!s_pces->server_saved) {
     setNote(sc, "No contact advertises PCES. Pick the Commsol station (or a room it hosts):");
   }

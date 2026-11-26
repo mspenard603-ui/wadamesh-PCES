@@ -36405,7 +36405,7 @@ static bool ctPassesFilter(const ContactInfo& c, bool is_fav, int fav_count, con
     case 4u: if(!(c.gps_lat!=0 || c.gps_lon!=0)) return false; break;      // has location
     case 5u: if (pathHops(c.out_path_len) != 0) return false; break;                  // 0-hop / direct neighbors only
     case 6u: if (c.type != ADV_TYPE_ROOM) return false; break;             // room servers
-    case 7u: if (!PcesProto::answersPces(the_mesh.advertFeat1(c.id.pub_key))) return false; break;   // PCES servers (RAM marker, PcesApp.h)
+    case 7u: if (!PcesProto::answersPces(the_mesh.advertFeat1(c.id.pub_key)) && !pcesIsSavedServer(c.id.pub_key)) return false; break;   // PCES servers: marker, or the saved one (PcesApp.h)
     default: break;                                                        // 0 = all
   }
   if(needle && needle[0]){
