@@ -1,0 +1,28 @@
+# PCES retries on a lost packet (src/ui-touch/PcesApp.h), web host build, demo backend
+# dropping the first PCES request:
+#   WADA_DATA_DIR=$(mktemp -d) WADA_DEMO_PCES=1 WADA_DEMO_PCES_DROP=1 web/build-host/wadamesh-host --headless --script web/scripts/pces-retry.wada --shots <dir>
+# Expect: pces-r1 the log shows INFO with no answer, "asking again, 2 of 3", then INFO,
+# PATH and the route accepted.
+wait 5000
+tap 60 283
+wait 2500
+tap 697 360
+wait 1500
+tap 621 75
+wait 1500
+tap 400 162
+wait 1200
+tap 400 446
+wait 1200
+tap 400 326
+wait 25000
+tap 795 300
+wait 25000
+tap 795 300
+wait 15000
+tap 795 300
+wait 1000
+drag 400 420 400 120
+wait 1000
+shot pces-r1-retry
+quit

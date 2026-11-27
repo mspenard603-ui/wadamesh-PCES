@@ -154,14 +154,25 @@ last hash on its flood path), and B is the station itself (length 0). This is th
 spec's worked example.
 
 - An advert heard direct is ignored: there is nothing to improve.
-- Each server is asked at most once per 6 hours. There is a single attempt and no retry.
+- Each server is asked at most once per 6 hours from its adverts. Each ask retries as above.
 - The ask never runs while the PCES page is open or another request is in flight.
-- If the server has no route yet, the answer is installed, with a toast. Otherwise the route is left alone.
+- The answer is installed, with a toast, if the server has no route yet or its route is
+  one PCES installed earlier. A route MeshCore learned itself is left alone.
+
+**When you move.** Every 30 s the T-Deck compares its GPS position with where it was
+when the server's route was last asked. After **0.5 km** it asks again, at most once
+every 2 minutes, and installs the answer by the same rule. The first hop comes from the
+Find Best Route candidates (current first hop, then repeaters heard directly). PCES
+servers are fixed stations, so only this device's movement counts. It needs a GPS fix.
 
 ### On-air etiquette (Commsol spec)
 
 - Requests are sent only on Find Best Route, Server info, or a PCES server's advert. Never on a timer or in a loop over contacts.
-- No request is retried. A run tries at most 3 first hops, each once.
+- A request with no answer is retried, up to **3 tries per step** (login, INFO, PATH), in
+  Find Best Route and the automatic asks alike. On LoRa that is almost always a lost
+  packet, ours or the reply, because a found PCES server is all but always up. Each try
+  waits 15 s for a login and 20 s for a request. A late reply to an earlier try is
+  ignored. A run tries at most 3 first hops.
 - At most one PCES request every **12 s**, so 5 a minute, matching the server's limit. The login doesn't count towards it.
 - PCES requests share the UI's single-flight request slot with status, telemetry and admin requests and never clobber them.
 

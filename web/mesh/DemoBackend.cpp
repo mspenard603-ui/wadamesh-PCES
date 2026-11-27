@@ -459,6 +459,13 @@ private:
     switch (ql ? q[0] : 0) {
       case 0xC5: {   // PCES (Commsol path service, src/helpers/PcesProto.h): a canned station
         if (ql < 3 || q[1] != 1) return;   // other versions: no answer
+        // WADA_DEMO_PCES_DROP=N: the first N PCES requests get no answer (a lost packet),
+        // to exercise the client's retries (web/scripts/pces-retry.wada).
+        {
+          static int s_drop = -1;
+          if (s_drop < 0) { const char* d = getenv("WADA_DEMO_PCES_DROP"); s_drop = d ? atoi(d) : 0; }
+          if (s_drop > 0) { --s_drop; return; }
+        }
         r.push_back(1); r.push_back(q[2]);
         if (q[2] == 0x00) {                // INFO: 7-day window, 42 links, newest 3 min, -7.5 dB, SF11
           r.push_back(0); u16(168); u16(42); u16(3); r.push_back((uint8_t)(int8_t)-30); r.push_back(11);

@@ -29,7 +29,9 @@
 // On-air etiquette, from the Commsol spec:
 //   * nothing is sent except on Find Best Route / Server info, or a PCES server's advert -- never on
 //     a timer and never in a loop over contacts;
-//   * no request is retried; a run tries at most 3 first hops, each once;
+//   * a request with no answer is retried, up to 3 tries per step: on LoRa that is almost
+//     always a lost packet (a found PCES server is all but always up); a run tries at
+//     most 3 first hops;
 //   * at most one PCES request every 12 s (the server answers 5 a minute per client).
 //
 // Native firmware on purpose: Lua apps cannot transmit requests to nodes. It reuses what
@@ -48,8 +50,12 @@ namespace {
 namespace PP = PcesProto;
 
 static constexpr uint32_t kPcesReqGapMs     = 12000;   // 5 a minute, the server's limit
-static constexpr uint32_t kPcesLoginWaitMs  = 20000;
-static constexpr uint32_t kPcesReplyWaitMs  = 40000;   // under the UI slot's 45 s expiry
+static constexpr uint32_t kPcesLoginWaitMs  = 15000;   // per attempt
+static constexpr uint32_t kPcesReplyWaitMs  = 20000;   // per attempt (under the UI slot's 45 s expiry)
+static constexpr uint8_t  kPcesMaxAttempts  = 3;       // LoRa loses packets; a found server is up
+static constexpr double   kPcesMoveKm       = 0.5;     // re-ask the server's route after we move this far
+static constexpr uint32_t kPcesMoveCheckMs  = 30000;
+static constexpr uint32_t kPcesMoveMinGapMs = 120000;  // at most one move-triggered ask per 2 min
 static constexpr uint32_t kPcesAfterLoginMs = 2500;    // let the re-flooded login reply pass (#683)
 static constexpr uint32_t kPcesSessionMs    = 15u * 60u * 1000u;
 static constexpr uint32_t kPcesAutoEveryMs  = 6u * 60u * 60u * 1000u;   // re-ask a server after 6 h
@@ -101,6 +107,15 @@ struct PcesState {
   bool     have_target;
   // The run in progress.
   uint8_t  run, step, next_step;          // next_step: what follows a login
+  uint8_t  attempt;                      // tries of the current step (retried on no answer)
+  uint8_t  hop_exclude[PUB_KEY_SIZE];    // never a first hop: the target / the server itself
+  bool     hop_exclude_set;
+  // Location-triggered re-asks of the best path to the PCES server.
+  bool     mv_have;
+  uint8_t  mv_srv[PUB_KEY_SIZE];
+  double   mv_self_lat, mv_self_lon;    // where we were at the last ask
+  uint32_t mv_check_ms, mv_last_ask_ms;
+  bool     mv_ask;                       // the auto run in flight was a move re-ask
   uint8_t  req_server[PUB_KEY_SIZE];     // who the login / request in flight went to
   uint32_t deadline, send_at, last_req_ms;
   bool     have_last_req;
@@ -164,6 +179,8 @@ void pcesInstall(bool backed);   // fwd
 void pcesCompareTick(uint32_t now);   // fwd
 void pcesBenchMissed();              // fwd
 void pcesBadgesChanged();            // fwd
+void pcesSendLogin();                // fwd
+void pcesMoveBaseline(const ContactInfo& srv);   // fwd
 }  // namespace
 // Defined in UITask.cpp beside the UI data filesystem: appends a line to `path` (made
 // relative to the UI data root, directories created); `fresh` truncates first.
@@ -385,18 +402,28 @@ void pcesBegin(uint8_t run, ContactInfo* srv, uint8_t next) {
     s_pces->send_at = pcesFloorAt();
     return;
   }
+  s_pces->next_step = next;
+  s_pces->attempt = 0;
+  pcesSendLogin();
+}
+// (Re)send the guest login for the run in progress.
+void pcesSendLogin() {
+  ContactInfo* srv = the_mesh.lookupContactByPubKey(s_pces->req_server, PUB_KEY_SIZE);
   // Blank = PCES-only guest at a station. Keeps the stored route: the admin app's login
   // wipes it first, which would throw away a route PCES itself installed to the server.
-  const int r = the_mesh.uiSendGuestLoginKeepPath(*srv);
+  const int r = srv ? the_mesh.uiSendGuestLoginKeepPath(*srv) : MSG_SEND_FAILED;
   if (r != MSG_SEND_SENT_FLOOD && r != MSG_SEND_SENT_DIRECT) {
-    if (run != PRUN_AUTO) pcesLog(SET_TONE_DANGER, "%s", TR("Login not sent: radio busy."));
+    if (s_pces->run != PRUN_AUTO) pcesLog(SET_TONE_DANGER, "%s", TR("Login not sent: radio busy."));
     pcesEndRun();
     return;
   }
+  s_pces->attempt++;
   s_pces->step = PST_LOGIN_WAIT;
   s_pces->deadline = millis() + kPcesLoginWaitMs;
-  s_pces->next_step = next;
-  if (run != PRUN_AUTO) pcesLog(SET_TONE_INFO, TR("Logging in to %s as a guest..."), pcesName(*srv));
+  if (s_pces->run != PRUN_AUTO) {
+    if (s_pces->attempt == 1) pcesLog(SET_TONE_INFO, TR("Logging in to %s as a guest..."), pcesName(*srv));
+    else pcesLog(SET_TONE_INFO, TR("No login reply (packet lost?): trying again, %u of %u..."), (unsigned)s_pces->attempt, (unsigned)kPcesMaxAttempts);
+  }
 }
 bool pcesSend(uint8_t wait_step) {
   ContactInfo* srv = the_mesh.lookupContactByPubKey(s_pces->req_server, PUB_KEY_SIZE);
@@ -406,6 +433,7 @@ bool pcesSend(uint8_t wait_step) {
   s_pces->step = wait_step;
   s_pces->deadline = millis() + kPcesReplyWaitMs;
   s_pces->last_req_ms = millis(); s_pces->have_last_req = true;
+  s_pces->attempt++;
   return true;
 }
 
@@ -414,8 +442,8 @@ void pcesAddHop(const uint8_t* hop, const char* name) {
   if (s_pces->n_hops >= kPcesMaxFirstHops) return;
   for (int i = 0; i < s_pces->n_hops; ++i)
     if (memcmp(s_pces->hops[i].hop, hop, s_pces->width) == 0) return;
-  // The target itself is never its own first hop.
-  if (s_pces->b_is_contact && memcmp(hop, s_pces->target, s_pces->width) == 0) return;
+  // The target (or the server, for a path to it) is never its own first hop.
+  if (s_pces->hop_exclude_set && memcmp(hop, s_pces->hop_exclude, s_pces->width) == 0) return;
   auto& h = s_pces->hops[s_pces->n_hops++];
   memcpy(h.hop, hop, s_pces->width);
   snprintf(h.name, sizeof h.name, "%s", name ? name : "");
@@ -496,6 +524,8 @@ void pcesStartTest() {
     memcpy(s_pces->b, t->out_path + (size_t)(th - 1) * s_pces->width, s_pces->width);
     s_pces->blen = s_pces->width;
   }
+  memcpy(s_pces->hop_exclude, t->id.pub_key, PUB_KEY_SIZE);
+  s_pces->hop_exclude_set = s_pces->b_is_contact;
   pcesFindFirstHops(*t);
   char hx[12], line[96];
   if (s_pces->n_hops == 0) {
@@ -611,9 +641,13 @@ void pcesAutoAnswer() {
   memcpy(s_pces->answer_for, srv->id.pub_key, PUB_KEY_SIZE);
   s_pces->have_answer = true;
   char msg[96];
-  if (srv->out_path_len == OUT_PATH_UNKNOWN) {
+  // Install when there is no route yet, or when the route is one PCES installed earlier
+  // (after a move it is likely stale). A route MeshCore learned itself is left alone.
+  if (srv->out_path_len == OUT_PATH_UNKNOWN || the_mesh.uiRoutePinned(srv->id.pub_key)) {
     pcesInstall(true);
-    snprintf(msg, sizeof msg, TR("PCES: route to %s installed (metric %u)"), pcesName(*srv), (unsigned)s_pces->ans.metric);
+    snprintf(msg, sizeof msg, s_pces->mv_ask ? TR("PCES: moved, new route to %s (metric %u)")
+                                             : TR("PCES: route to %s installed (metric %u)"),
+             pcesName(*srv), (unsigned)s_pces->ans.metric);
   } else {
     snprintf(msg, sizeof msg, TR("PCES: best path to %s, metric %u. See PCES."), pcesName(*srv), (unsigned)s_pces->ans.metric);
   }
@@ -641,7 +675,64 @@ void pcesAutoTick() {
   pcesMarkAsked(s_pces->auto_pub);   // asked, answered or not: once per server per 6 h
   s_pces->width = s_pces->auto_width;
   s_pces->have_answer = false;
-  pcesBuildPath(s_pces->auto_hop, s_pces->auto_width, nullptr, 0, false);   // B = the station
+  s_pces->n_hops = 1; s_pces->hop_i = 0;   // the relay that delivered the advert
+  memcpy(s_pces->hops[0].hop, s_pces->auto_hop, s_pces->width);
+  s_pces->hops[0].name[0] = 0;
+  s_pces->mv_ask = false;
+  pcesMoveBaseline(*srv);
+  pcesBegin(PRUN_AUTO, srv, PST_PATH_SEND);
+}
+
+// ---- re-ask when this device moved more than kPcesMoveKm ---------------------------------
+// The first hop to the server changes as we move (servers are fixed stations).
+double pcesKm(double la1, double lo1, double la2, double lo2) {
+  const double R = 6371.0, d2r = 0.017453292519943295;
+  const double dla = (la2 - la1) * d2r, dlo = (lo2 - lo1) * d2r;
+  const double a = sin(dla / 2) * sin(dla / 2) + cos(la1 * d2r) * cos(la2 * d2r) * sin(dlo / 2) * sin(dlo / 2);
+  return 2 * R * atan2(sqrt(a), sqrt(1 - a));
+}
+// Where we were when the server's route was last asked.
+void pcesMoveBaseline(const ContactInfo& srv) {
+  memcpy(s_pces->mv_srv, srv.id.pub_key, PUB_KEY_SIZE);
+  s_pces->mv_self_lat = g_lv.task ? g_lv.task->getNodeLat() : 0;
+  s_pces->mv_self_lon = g_lv.task ? g_lv.task->getNodeLon() : 0;
+  s_pces->mv_have = true;
+}
+void pcesMoveTick(uint32_t now) {
+  if ((uint32_t)(now - s_pces->mv_check_ms) < kPcesMoveCheckMs) return;
+  s_pces->mv_check_ms = now;
+  ContactInfo* srv = pcesServer();
+  if (!srv || !g_lv.task) return;
+  const double sla = g_lv.task->getNodeLat(), slo = g_lv.task->getNodeLon();
+  if (!s_pces->mv_have || memcmp(s_pces->mv_srv, srv->id.pub_key, PUB_KEY_SIZE) != 0) {
+    pcesMoveBaseline(*srv);   // first sight of this server: start measuring from here
+    return;
+  }
+  // PCES servers are fixed stations: only this device moving changes its first hop.
+  if (sla == 0 && slo == 0) return;   // no position fix
+  if (s_pces->mv_self_lat == 0 && s_pces->mv_self_lon == 0) {
+    pcesMoveBaseline(*srv);   // our first fix since the last ask: measure from here
+    return;
+  }
+  const double moved = pcesKm(s_pces->mv_self_lat, s_pces->mv_self_lon, sla, slo);
+  if (moved <= kPcesMoveKm) return;
+  // Moved: ask again -- never under the user, and not more than once per 2 min.
+  if (s_pces->open || s_pces->run != PRUN_NONE || the_mesh.hasUIRequestPending()) return;
+  if ((int32_t)(now - pcesFloorAt()) < 0) return;
+  if (s_pces->mv_last_ask_ms && (uint32_t)(now - s_pces->mv_last_ask_ms) < kPcesMoveMinGapMs) return;
+  s_pces->width = pcesHasPath(*srv) ? (uint8_t)((srv->out_path_len >> 6) + 1)
+                                    : (uint8_t)(the_mesh.getNodePrefs()->path_hash_mode + 1);
+  if (s_pces->width > PP::MAX_WIDTH) s_pces->width = PP::MAX_WIDTH;
+  s_pces->b_is_contact = true;   // only for the exclusion below
+  memcpy(s_pces->hop_exclude, srv->id.pub_key, PUB_KEY_SIZE);
+  s_pces->hop_exclude_set = true;
+  pcesFindFirstHops(*srv);
+  if (s_pces->n_hops == 0) { pcesMoveBaseline(*srv); return; }   // nothing heard directly: wait for an advert
+  s_pces->hop_i = 0;
+  s_pces->mv_last_ask_ms = now;
+  s_pces->mv_ask = true;
+  s_pces->have_answer = false;
+  pcesMoveBaseline(*srv);
   pcesBegin(PRUN_AUTO, srv, PST_PATH_SEND);
 }
 
@@ -657,6 +748,7 @@ bool pcesOnLoginResult(const ContactInfo& contact, bool success, uint8_t) {
   memcpy(s_pces->session_server, s_pces->req_server, PUB_KEY_SIZE);
   s_pces->session_ms = millis(); s_pces->session_valid = true;
   s_pces->step = s_pces->next_step;   // what pcesBegin was asked to do next
+  s_pces->attempt = 0;
   const uint32_t after = millis() + kPcesAfterLoginMs, floor_at = pcesFloorAt();
   s_pces->send_at = (int32_t)(after - floor_at) > 0 ? after : floor_at;
   if (s_pces->run != PRUN_AUTO) pcesLog(SET_TONE_HELP, "%s", TR("Logged in."));
@@ -680,6 +772,7 @@ bool pcesOnBinaryReply(const ContactInfo& contact, const uint8_t* data, size_t l
     }
     if (s_pces->run == PRUN_INFO) { pcesEndRun(); return true; }
     s_pces->step = PST_PATH_SEND;
+    s_pces->attempt = 0;
     s_pces->send_at = pcesFloorAt();
     return true;
   }
@@ -687,8 +780,12 @@ bool pcesOnBinaryReply(const ContactInfo& contact, const uint8_t* data, size_t l
   const bool ok = PP::decodePath(data, len, s_pces->plan.width, s_pces->ans);
   if (ok) s_pces->route_hops = PP::routeFromAnswer(s_pces->plan, s_pces->ans, s_pces->route);
   if (s_pces->run == PRUN_AUTO) {
-    if (ok) pcesAutoAnswer();
-    pcesEndRun();
+    if (ok && s_pces->route_hops >= 0) { pcesAutoAnswer(); pcesEndRun(); return true; }
+    if (++s_pces->hop_i < s_pces->n_hops) {   // PCES does not know that first hop: the next one
+      s_pces->step = PST_PATH_SEND; s_pces->attempt = 0; s_pces->send_at = pcesFloorAt();
+    } else {
+      pcesEndRun();
+    }
     return true;
   }
   if (ok && s_pces->route_hops >= 0) {
@@ -703,6 +800,7 @@ bool pcesOnBinaryReply(const ContactInfo& contact, const uint8_t* data, size_t l
   // PCES does not know this first hop (or has no path from it): try the next one.
   if (++s_pces->hop_i < s_pces->n_hops) {
     s_pces->step = PST_PATH_SEND;
+    s_pces->attempt = 0;
     s_pces->send_at = pcesFloorAt();
   } else {
     pcesLog(SET_TONE_WARN, "%s", TR("No route found from any first hop."));
@@ -744,9 +842,28 @@ void pcesTimerCb(lv_timer_t*) {
     case PST_INFO_WAIT:
     case PST_PATH_WAIT:
       if ((int32_t)(now - s_pces->deadline) >= 0) {
+        // No answer. A found PCES server is all but always up, so this is almost always a
+        // lost packet (ours or the reply): try again, up to kPcesMaxAttempts per step.
+        const bool login = s_pces->step == PST_LOGIN_WAIT;
+        if (!login) the_mesh.cancelUIPingPending();   // free the slot; a late reply is ignored (tag)
+        if (s_pces->attempt < kPcesMaxAttempts) {
+          if (login) {
+            pcesSendLogin();
+          } else {
+            const bool info = s_pces->step == PST_INFO_WAIT;
+            if (s_pces->run != PRUN_AUTO)
+              pcesLog(SET_TONE_INFO, TR("No answer (packet lost?): asking again, %u of %u, after the 12 s gap..."),
+                      (unsigned)(s_pces->attempt + 1), (unsigned)kPcesMaxAttempts);
+            s_pces->step = info ? PST_INFO_SEND : PST_PATH_SEND;
+            s_pces->send_at = pcesFloorAt();
+          }
+          s_pces->dirty = true;
+          break;
+        }
         s_pces->session_valid = false;   // a station restart, or a full client list, drops guests
         if (s_pces->run != PRUN_AUTO)
-          pcesLog(SET_TONE_WARN, "%s", TR("No answer from PCES. Not retried: check the station is in range and running."));
+          pcesLog(SET_TONE_WARN, TR("No answer from PCES after %u tries: check the station is in range and running."),
+                  (unsigned)kPcesMaxAttempts);
         pcesEndRun();
       }
       break;
@@ -762,6 +879,8 @@ void pcesTimerCb(lv_timer_t*) {
       if ((int32_t)(now - s_pces->send_at) >= 0) {
         if (s_pces->run == PRUN_TEST)
           pcesBuildPath(s_pces->hops[s_pces->hop_i].hop, s_pces->width, s_pces->b, s_pces->blen, s_pces->b_is_contact);
+        else if (s_pces->run == PRUN_AUTO)   // the best path from a first hop to the station itself
+          pcesBuildPath(s_pces->hops[s_pces->hop_i].hop, s_pces->width, nullptr, 0, false);
         if (pcesSend(PST_PATH_WAIT)) {
           if (s_pces->run == PRUN_TEST) {
             char a[12], b[20];
@@ -785,6 +904,7 @@ void pcesTimerCb(lv_timer_t*) {
   }
   pcesCompareTick(now);
   if (s_pces->run == PRUN_NONE) pcesAutoTick();
+  if (s_pces->run == PRUN_NONE) pcesMoveTick(now);
   if (s_pces->dirty) { s_pces->dirty = false; if (s_pces->open) pcesRender(); }
 }
 
