@@ -116,6 +116,12 @@ struct PcesState {
   double   mv_self_lat, mv_self_lon;    // where we were at the last ask
   uint32_t mv_check_ms, mv_last_ask_ms;
   bool     mv_ask;                       // the auto run in flight was a move re-ask
+  // Return-path seed after a route is installed: (guest login, then) one PATH packet.
+  uint8_t  seed_step;                    // 0 idle, 1 waiting for the login, 2 send at seed_at
+  uint8_t  seed_pub[PUB_KEY_SIZE];
+  uint32_t seed_deadline, seed_at;
+  uint8_t  seed_attempt;
+  bool     seed_log;                     // say what happened on the page log
   uint8_t  req_server[PUB_KEY_SIZE];     // who the login / request in flight went to
   uint32_t deadline, send_at, last_req_ms;
   bool     have_last_req;
@@ -181,6 +187,7 @@ void pcesBenchMissed();              // fwd
 void pcesBadgesChanged();            // fwd
 void pcesSendLogin();                // fwd
 void pcesMoveBaseline(const ContactInfo& srv);   // fwd
+void pcesSeedStart(const ContactInfo& t, bool log);   // fwd
 }  // namespace
 // Defined in UITask.cpp beside the UI data filesystem: appends a line to `path` (made
 // relative to the UI data root, directories created); `fresh` truncates first.
@@ -612,6 +619,7 @@ void pcesInstall(bool backed) {
     memcpy(slot->new_path, t->out_path, sizeof slot->new_path);
     the_mesh.uiPinRoute(t->id.pub_key, true, s_pces->ans.metric);   // a failed Ping or a login must not wipe it
     pcesSaveAccepted();
+    pcesSeedStart(*t, s_pces->run != PRUN_AUTO);   // and the far end's way back: the same route reversed
     pcesBadgesChanged();                    // the "PCES <score>" badge
     pcesLog(SET_TONE_OK, "%s", backed ? TR("4. Accepted and installed (unverified until used). Restore puts the old route back.")
                                       : TR("Installed anyway (unverified). Restore puts the old route back."));
@@ -736,8 +744,82 @@ void pcesMoveTick(uint32_t now) {
   pcesBegin(PRUN_AUTO, srv, PST_PATH_SEND);
 }
 
+// ---- seed the far end's return path ------------------------------------------------------
+// Installing a route only fixes our direction: the far end still answers along its own
+// stored route to us, or floods. One standard PATH packet sent along the new route tells
+// it to use the same route reversed (MyMesh::uiSeedReturnPath). A repeater or room keeps
+// it only for a client on its access list, so a blank guest login goes first unless a
+// guest session with it is fresh. Login retried like the rest (3 tries); the PATH packet
+// goes once, 2.5 s after LOGIN_OK so it does not collide with the re-flooded login reply.
+static constexpr uint32_t kPcesSeedLoginWaitMs = 15000;
+void pcesSeedSend() {
+  ContactInfo* t = the_mesh.lookupContactByPubKey(s_pces->seed_pub, PUB_KEY_SIZE);
+  s_pces->seed_step = 0;
+  if (!t) return;
+  char rt[64];
+  if (pcesHasPath(*t)) {
+    const uint8_t n = t->out_path_len & 63, w = (uint8_t)((t->out_path_len >> 6) + 1);
+    uint8_t rev[MAX_PATH_SIZE];
+    for (uint8_t i = 0; i < n; ++i) memcpy(&rev[i * w], &t->out_path[(n - 1 - i) * w], w);
+    pcesFmtRoute(rev, n, w, rt, sizeof rt);
+  } else {
+    snprintf(rt, sizeof rt, "-");
+  }
+  const bool ok = the_mesh.uiSeedReturnPath(t->id.pub_key);
+  if (s_pces->seed_log) {
+    if (ok) pcesLog(SET_TONE_OK, TR("Return path seeded: %s will reply via %s."), pcesName(*t), rt);
+    else pcesLog(SET_TONE_WARN, "%s", TR("Return path not seeded: no fixed route to send it along."));
+  }
+}
+void pcesSeedLogin() {
+  ContactInfo* t = the_mesh.lookupContactByPubKey(s_pces->seed_pub, PUB_KEY_SIZE);
+  const int r = t ? the_mesh.uiSendGuestLoginKeepPath(*t) : MSG_SEND_FAILED;
+  if (r != MSG_SEND_SENT_FLOOD && r != MSG_SEND_SENT_DIRECT) {
+    s_pces->seed_step = 0;
+    if (s_pces->seed_log) pcesLog(SET_TONE_WARN, "%s", TR("Return path not seeded: login not sent."));
+    return;
+  }
+  s_pces->seed_attempt++;
+  s_pces->seed_step = 1;
+  s_pces->seed_deadline = millis() + kPcesSeedLoginWaitMs;
+}
+void pcesSeedStart(const ContactInfo& t, bool log) {
+  memcpy(s_pces->seed_pub, t.id.pub_key, PUB_KEY_SIZE);
+  s_pces->seed_log = log;
+  s_pces->seed_attempt = 0;
+  if (pcesIsRelay(t) && !pcesSessionFresh(t.id.pub_key)) {
+    if (log) pcesLog(SET_TONE_INFO, TR("Seeding the return path: logging in to %s as a guest first..."), pcesName(t));
+    pcesSeedLogin();
+  } else {
+    s_pces->seed_step = 2;
+    s_pces->seed_at = millis() + kPcesAfterLoginMs;
+  }
+}
+void pcesSeedTick(uint32_t now) {
+  if (s_pces->seed_step == 1 && (int32_t)(now - s_pces->seed_deadline) >= 0) {
+    if (s_pces->seed_attempt < kPcesMaxAttempts) { pcesSeedLogin(); s_pces->dirty = true; return; }
+    s_pces->seed_step = 0;
+    if (s_pces->seed_log) pcesLog(SET_TONE_WARN, TR("Return path not seeded: no login reply after %u tries."), (unsigned)kPcesMaxAttempts);
+  } else if (s_pces->seed_step == 2 && (int32_t)(now - s_pces->seed_at) >= 0) {
+    pcesSeedSend();
+    s_pces->dirty = true;
+  }
+}
+
 // ---- replies (from UITask's mesh callbacks) ---------------------------------------------
 bool pcesOnLoginResult(const ContactInfo& contact, bool success, uint8_t) {
+  if (s_pces && s_pces->seed_step == 1 && memcmp(contact.id.pub_key, s_pces->seed_pub, PUB_KEY_SIZE) == 0 &&
+      !(s_pces->step == PST_LOGIN_WAIT && memcmp(contact.id.pub_key, s_pces->req_server, PUB_KEY_SIZE) == 0)) {
+    if (success) {
+      s_pces->seed_step = 2;
+      s_pces->seed_at = millis() + kPcesAfterLoginMs;
+    } else {
+      s_pces->seed_step = 0;
+      if (s_pces->seed_log) pcesLog(SET_TONE_WARN, "%s", TR("Return path not seeded: the login was refused."));
+    }
+    s_pces->dirty = true;
+    return true;
+  }
   if (!s_pces || s_pces->step != PST_LOGIN_WAIT ||
       memcmp(contact.id.pub_key, s_pces->req_server, PUB_KEY_SIZE) != 0) return false;
   if (!success) {
@@ -903,8 +985,9 @@ void pcesTimerCb(lv_timer_t*) {
     else pcesLog(SET_TONE_WARN, "%s", TR("Trace: no reply in 20 s. A hop on this route may not be reachable."));
   }
   pcesCompareTick(now);
-  if (s_pces->run == PRUN_NONE) pcesAutoTick();
-  if (s_pces->run == PRUN_NONE) pcesMoveTick(now);
+  pcesSeedTick(now);
+  if (s_pces->run == PRUN_NONE && s_pces->seed_step == 0) pcesAutoTick();
+  if (s_pces->run == PRUN_NONE && s_pces->seed_step == 0) pcesMoveTick(now);
   if (s_pces->dirty) { s_pces->dirty = false; if (s_pces->open) pcesRender(); }
 }
 

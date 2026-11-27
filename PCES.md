@@ -53,6 +53,28 @@ room target turns the trace itself. A companion doesn't relay traces, so its tra
 turns at its last relay. There is one trace every 15 s, and no reply within 20 s is
 reported.
 
+### The far end's way back (return-path seed)
+
+Installing a route only fixes your direction. The far end still answers along its own
+stored route to you, or floods; MeshCore ignores the path a direct request came in on.
+So whenever PCES installs a route (Find Best Route, Use anyway, or an automatic ask), it
+then **seeds the far end's return path**:
+
+1. A repeater or room keeps a route only for a client on its access list. So unless a
+   guest session with it is fresh, a blank guest login goes first, along the new route,
+   retried up to 3 times.
+2. 2.5 s after LOGIN_OK (straight away for a companion), one standard MeshCore **PATH**
+   packet goes **direct along the new route**. It is the packet
+   `BaseChatMesh::handleReturnPathRetry` sends, and its content is the route reversed.
+3. The far end stores that as its route back to you: a repeater or room in
+   `onPeerPathRecv`, a companion for a known contact. This is stock firmware, nothing
+   custom on the far end.
+
+The page logs it, e.g. "Return path seeded: Diego will reply via 7F33 > F733 > BF78". The
+far end keeps it until it learns another route; a route that stops working repairs
+itself by flooding. A companion must have you as a contact to accept it. Restore puts
+your route back but doesn't re-seed the far end.
+
 ### Kept across reboots
 
 These survive a reboot, stored in NVS:

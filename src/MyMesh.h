@@ -1271,6 +1271,25 @@ public:
     return false;
   }
 
+  /** PCES: tell the contact to reach us along the reverse of our stored route to it.
+   *  Sends a standard PATH packet (what BaseChatMesh::handleReturnPathRetry sends) DIRECT
+   *  along our out_path; its content is that route reversed -- the contact's route back
+   *  to us, first hop (its neighbour) first. A repeater / room stores it for a client on
+   *  its access list (onPeerPathRecv), a companion for a known contact; stock firmware,
+   *  nothing custom on the far end. Returns false when there is no fixed route to send
+   *  along or the packet could not be made. */
+  bool uiSeedReturnPath(const uint8_t pub_key[PUB_KEY_SIZE]) {
+    ContactInfo* c = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
+    if (!c || c->out_path_len == OUT_PATH_UNKNOWN || !mesh::Packet::isValidPathLen(c->out_path_len)) return false;
+    const uint8_t n = c->out_path_len & 63, sz = (uint8_t)((c->out_path_len >> 6) + 1);
+    uint8_t rev[MAX_PATH_SIZE];
+    for (uint8_t i = 0; i < n; ++i) memcpy(&rev[i * sz], &c->out_path[(n - 1 - i) * sz], sz);
+    mesh::Packet* pkt = createPathReturn(c->id, c->getSharedSecret(self_id), rev, c->out_path_len, 0, NULL, 0);
+    if (!pkt) return false;
+    sendDirect(pkt, c->out_path, c->out_path_len, 0);
+    return true;
+  }
+
   /** PCES benchmark: learn the contact's normal (MeshCore) path without keeping it.
    *  Sends what MeshCore's own path discovery sends -- a flooded request, whose reply
    *  comes back as a PATH packet carrying the route to the contact: a blank guest login

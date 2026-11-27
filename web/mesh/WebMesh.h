@@ -251,6 +251,12 @@ public:
   // PCES benchmark path discovery. The mirror has no flood to learn from: in the demo
   // (WADA_DEMO_PCES=1) the "discovered" default is the contact's stored route, or for
   // a contact with none, Hilltop > Harbor hashes; elsewhere nothing comes back.
+  // PCES return-path seed: nothing to send from the mirror; reports success in the demo.
+  bool uiSeedReturnPath(const uint8_t pub_key[32]) {
+    const char* e = getenv("WADA_DEMO_PCES");
+    ContactInfo* c = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
+    return e && e[0] == '1' && c && c->out_path_len != OUT_PATH_UNKNOWN;
+  }
   int uiDiscoverPath(ContactInfo& c);
   bool uiTakeDiscoveredPath(uint8_t* len, uint8_t* path);
   void uiCancelPathDiscovery() { _pd_armed = false; }
