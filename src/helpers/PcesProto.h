@@ -14,8 +14,11 @@
 //     INFO  0x00  -
 //     PATH  0x01  [width 1..4][lenA][A..][lenB][B..]   (len 0 = the answering station)
 //     LINK  0x02  [lenA][A..][lenB][B..]
+//     PATH BOTH WAYS  0x03  as PATH: only links measured in both directions, each leg
+//           scored by its weaker one, so the path's reverse holds as the far end's way back
+//           (a server from before it answers status 9, unsupported)
 //   response  (after the 4-byte reflected tag) [1][op][status] + body when status 0
-//     PATH  [metric u8][weakest SNR i8][flags u8][count u8][count x width]
+//     PATH, PATH BOTH WAYS  [metric u8][weakest SNR i8][flags u8][count u8][count x width]
 //     LINK  [ab u8][ba u8][ab SNR i8][ba SNR i8][ab n u16][ba n u16][age min u16]
 //     INFO  [window h u16][links u16][newest min u16][decode limit i8][SF u8]
 #include <stddef.h>
@@ -26,7 +29,7 @@ namespace PcesProto {
 
 static constexpr uint8_t REQ_TYPE = 0xC5;
 static constexpr uint8_t VERSION = 1;
-enum Op : uint8_t { OP_INFO = 0x00, OP_PATH = 0x01, OP_LINK = 0x02 };
+enum Op : uint8_t { OP_INFO = 0x00, OP_PATH = 0x01, OP_LINK = 0x02, OP_PATH_BOTH = 0x03 };
 enum Status : uint8_t {
   ST_OK = 0, ST_NO_PATH = 1, ST_A_UNKNOWN = 2, ST_B_UNKNOWN = 3, ST_A_AMBIGUOUS = 4,
   ST_B_AMBIGUOUS = 5, ST_BAD_REQUEST = 6, ST_RATE_LIMITED = 7, ST_NO_DATA = 8, ST_UNSUPPORTED = 9,
@@ -68,9 +71,11 @@ inline size_t encodeInfo(uint8_t* out) {
   out[0] = REQ_TYPE; out[1] = VERSION; out[2] = OP_INFO;
   return 3;
 }
-inline size_t encodePath(uint8_t* out, const uint8_t* a, uint8_t alen, const uint8_t* b, uint8_t blen, uint8_t width) {
+// both_ways: PATH BOTH WAYS, for a route whose reverse is also sent to the far end.
+inline size_t encodePath(uint8_t* out, const uint8_t* a, uint8_t alen, const uint8_t* b, uint8_t blen, uint8_t width,
+                         bool both_ways = false) {
   size_t i = 0;
-  out[i++] = REQ_TYPE; out[i++] = VERSION; out[i++] = OP_PATH; out[i++] = width;
+  out[i++] = REQ_TYPE; out[i++] = VERSION; out[i++] = both_ways ? OP_PATH_BOTH : OP_PATH; out[i++] = width;
   i += putNode(out + i, a, alen);
   i += putNode(out + i, b, blen);
   return i;
@@ -89,6 +94,7 @@ struct PathAnswer {
   uint8_t metric = 0;
   int8_t  weakest_snr4 = SNR_NONE;
   bool    starts_at_station = false, ends_at_station = false;
+  bool    both_ways = false;                 // a PATH BOTH WAYS answer: its reverse holds too
   uint8_t width = 0, hops = 0;
   uint8_t hop[MAX_HOPS * MAX_WIDTH] = {0};   // hops x width bytes, relays from A to B
 };
@@ -114,9 +120,12 @@ inline uint8_t header(const uint8_t* d, size_t len, uint8_t op) {
 }
 
 // `width` is the one we asked for: the answer's hops are that many bytes each.
+// Decodes PATH and PATH BOTH WAYS answers alike; both_ways says which it was.
 inline bool decodePath(const uint8_t* d, size_t len, uint8_t width, PathAnswer& out) {
   out = PathAnswer();
-  out.status = header(d, len, OP_PATH);
+  const uint8_t op = (d && len >= 2 && d[1] == OP_PATH_BOTH) ? OP_PATH_BOTH : OP_PATH;
+  out.status = header(d, len, op);
+  out.both_ways = op == OP_PATH_BOTH;
   if (out.status != ST_OK) return false;
   if (len < 7 || width < 1 || width > MAX_WIDTH) { out.status = ST_MALFORMED; return false; }
   const uint8_t n = d[6];

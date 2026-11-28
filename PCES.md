@@ -34,7 +34,11 @@ Nothing is sent before **Find Best Route**. Each step is logged on the page.
 
    PCES must know R, so several are kept to try.
 2. **Server.** A guest login (blank password; a station admits it as a PCES-only guest), reused for 15 minutes. Then **INFO**: link count, data window, newest measurement age, SF and decode limit.
-3. **Route.** PATH from R to the target. For a repeater or room the target is itself, and its own hash ends the path rather than being a hop. For a companion, which never relays, the target is its last relay, so a companion needs a known route first. When PCES doesn't know R, or has no path from it, the next R is tried.
+3. **Route.** PATH BOTH WAYS from R to the target: a path measured in both directions, each leg scored by its weaker one, so its reverse is safe to seed as the far end's way back (below). For a repeater or room the target is itself, and its own hash ends the path rather than being a hop. For a companion, which never relays, the target is its last relay, so a companion needs a known route first. When PCES doesn't know R, or has no path from it, the next R is tried.
+   - No R has a path both ways: one plain **PATH** from the first R that PCES knows. That path is scored in our direction only, so it is installed but no return path is seeded.
+   - A server from before PATH BOTH WAYS (status 9, older Commsol): plain PATH from each R, as before, and no return path is seeded.
+
+   With 3 first hops that is at most 5 requests with INFO, the server's limit a minute (not counting retries of lost ones).
 4. **Accept.** PCES's own data must back the route:
    - the weakest leg is at least **3 dB above the decode limit** INFO reported;
    - INFO's newest measurement is at most **60 minutes** old.
@@ -57,8 +61,10 @@ reported.
 
 Installing a route only fixes your direction. The far end still answers along its own
 stored route to you, or floods; MeshCore ignores the path a direct request came in on.
-So whenever PCES installs a route (Find Best Route, Use anyway, or an automatic ask), it
-then **seeds the far end's return path**:
+So whenever PCES installs a route from a PATH BOTH WAYS answer (Find Best Route, Use
+anyway, or an automatic ask), it then **seeds the far end's return path**. A route from a
+plain PATH answer is scored in your direction only: its reverse was never checked, so it
+isn't seeded, and the far end learns its own way back as usual.
 
 1. A repeater or room keeps a route only for a client on its access list. So unless a
    guest session with it is fresh, a blank guest login goes first, along the new route,
@@ -202,12 +208,12 @@ servers are fixed stations, so only this device's movement counts. It needs a GP
 
 | File | What |
 |---|---|
-| `src/helpers/PcesProto.h` | Pure codec: INFO/PATH/LINK, status texts, the feature-1 marker, answer-to-route conversion. |
+| `src/helpers/PcesProto.h` | Pure codec: INFO/PATH/PATH BOTH WAYS/LINK, status texts, the feature-1 marker, answer-to-route conversion. |
 | `src/ui-touch/PcesApp.h` | The page, the four-step run, the automatic ask, the service tick (started from `UITask::loop`). Included into `UITask.cpp` after `RepeaterAdminApp.h`. |
 | `src/MyMesh.h` | `onAdvertRecv` override that keeps advert feature 1 in a RAM cache (`advertFeat1`, never read from storage) and records PCES server adverts heard through relays (`takePcesAdvert`). Also `uiSetContactPath()`. |
 | `src/helpers/esp32/TouchPrefsStore.*` | `touchPrefsGet/SetPcesServer`: the saved server. |
 | `src/ui-touch/UITask.cpp` | The drawer tile, the contact-sheet button, the badge and filter, the reply hooks, Back/Esc. |
-| `web/mesh/*` | Stand-ins for the browser and host builds. `WADA_DEMO_PCES=1`: a canned PCES station on Hilltop Repeater, which is marked as a PCES server, and a 2-hop route to Diego. `WADA_DEMO_PCES_ADVERT=1`: a fake PCES server advert 8 s after boot. |
+| `web/mesh/*` | Stand-ins for the browser and host builds. `WADA_DEMO_PCES=1`: a canned PCES station on Hilltop Repeater, which is marked as a PCES server, and a 2-hop route to Diego. `WADA_DEMO_PCES_ADVERT=1`: a fake PCES server advert 8 s after boot. `WADA_DEMO_PCES_BOTH=none` / `old`: the canned station has no path both ways / predates PATH BOTH WAYS. |
 
 ## Testing
 

@@ -128,6 +128,10 @@ struct PcesState {
   uint8_t  req[24], req_len;
   PcesFirstHop hops[kPcesMaxFirstHops];
   uint8_t  n_hops, hop_i, width;
+  // PATH BOTH WAYS first (a route whose reverse is safe to seed); one plain PATH after.
+  bool     ask_both;                     // the PATH request to send is PATH BOTH WAYS
+  bool     both_unsupported;             // the server predates it: plain PATH from every first hop
+  int8_t   one_way_hop;                  // first hop PCES knows but has no both-ways path from (-1: none)
   bool     b_is_contact;
   uint8_t  b[PP::MAX_NODE], blen;
   PP::Plan plan;
@@ -403,6 +407,9 @@ void pcesEndRun() {
 // Log in (unless a session is fresh), then do `next` at the next allowed moment.
 void pcesBegin(uint8_t run, ContactInfo* srv, uint8_t next) {
   s_pces->run = run;
+  s_pces->ask_both = true;
+  s_pces->both_unsupported = false;
+  s_pces->one_way_hop = -1;
   memcpy(s_pces->req_server, srv->id.pub_key, PUB_KEY_SIZE);
   if (pcesSessionFresh(srv->id.pub_key)) {
     s_pces->step = next;
@@ -560,7 +567,7 @@ void pcesBuildPath(const uint8_t* a, uint8_t width, const uint8_t* b, uint8_t bl
   if (blen) memcpy(p.b, b, blen);
   p.blen = blen;
   p.b_is_contact = b_is_contact;
-  s_pces->req_len = (uint8_t)PP::encodePath(s_pces->req, p.a, p.alen, p.b, p.blen, p.width);
+  s_pces->req_len = (uint8_t)PP::encodePath(s_pces->req, p.a, p.alen, p.b, p.blen, p.width, s_pces->ask_both);
 }
 
 // Step 4 for a test run: does PCES's own data back the route?
@@ -571,7 +578,8 @@ void pcesAccept() {
   char snr[16], lim[16], rt[64];
   pcesFmtSnr(a.weakest_snr4, snr, sizeof snr);
   pcesFmtRoute(s_pces->route, s_pces->route_hops, s_pces->plan.width, rt, sizeof rt);
-  pcesLog(SET_TONE_HELP, TR("3. Route %s, metric %u, weakest leg %s"), rt, (unsigned)a.metric, snr);
+  pcesLog(SET_TONE_HELP, TR("3. Route %s, metric %u, weakest leg %s, %s"), rt, (unsigned)a.metric, snr,
+          a.both_ways ? TR("good both ways") : TR("scored this way only"));
   const char* why = nullptr;
   char whyb[96];
   if (!s_pces->have_info) why = TR("no INFO from the server to judge it by");
@@ -619,7 +627,13 @@ void pcesInstall(bool backed) {
     memcpy(slot->new_path, t->out_path, sizeof slot->new_path);
     the_mesh.uiPinRoute(t->id.pub_key, true, s_pces->ans.metric);   // a failed Ping or a login must not wipe it
     pcesSaveAccepted();
-    pcesSeedStart(*t, s_pces->run != PRUN_AUTO);   // and the far end's way back: the same route reversed
+    if (s_pces->ans.both_ways) {
+      pcesSeedStart(*t, s_pces->run != PRUN_AUTO);   // and the far end's way back: the same route reversed
+    } else if (s_pces->run != PRUN_AUTO) {
+      // A plain PATH is scored in our direction only: its reverse was never checked.
+      pcesLog(SET_TONE_INFO, TR("Return path not seeded: the route is scored this way only, so %s learns its own way back."),
+              pcesName(*t));
+    }
     pcesBadgesChanged();                    // the "PCES <score>" badge
     pcesLog(SET_TONE_OK, "%s", backed ? TR("4. Accepted and installed (unverified until used). Restore puts the old route back.")
                                       : TR("Installed anyway (unverified). Restore puts the old route back."));
@@ -838,6 +852,39 @@ bool pcesOnLoginResult(const ContactInfo& contact, bool success, uint8_t) {
   return true;
 }
 
+// Send the next PATH request at the next allowed moment.
+bool pcesSchedulePath() {
+  s_pces->step = PST_PATH_SEND;
+  s_pces->attempt = 0;
+  s_pces->send_at = pcesFloorAt();
+  return true;
+}
+// A PATH answer gave no route: what to ask next. PATH BOTH WAYS from every first hop; then,
+// if PCES knew one of them, one plain PATH from it. A server from before PATH BOTH WAYS gets
+// plain PATH from every first hop, as before it existed. Returns false when nothing is left.
+// At most n_hops + 1 requests (with INFO, within the server's 5 a minute).
+bool pcesNextPathRequest() {
+  const bool log = s_pces->run != PRUN_AUTO;
+  const uint8_t st = s_pces->ans.status;
+  if (s_pces->ask_both && st == PP::ST_UNSUPPORTED) {
+    s_pces->ask_both = false;
+    s_pces->both_unsupported = true;
+    if (log) pcesLog(SET_TONE_INFO, "%s", TR("3. This server has no PATH BOTH WAYS (older Commsol): asking a plain PATH; no return path will be seeded."));
+    return pcesSchedulePath();   // the same first hop again
+  }
+  if (s_pces->ask_both) {
+    if (st == PP::ST_NO_PATH && s_pces->one_way_hop < 0) s_pces->one_way_hop = (int8_t)s_pces->hop_i;
+    if (++s_pces->hop_i < s_pces->n_hops) return pcesSchedulePath();
+    if (s_pces->one_way_hop < 0) return false;
+    s_pces->ask_both = false;
+    s_pces->hop_i = (uint8_t)s_pces->one_way_hop;
+    if (log) pcesLog(SET_TONE_INFO, "%s", TR("3. No path measured both ways: asking a plain PATH; no return path will be seeded."));
+    return pcesSchedulePath();
+  }
+  if (s_pces->both_unsupported && ++s_pces->hop_i < s_pces->n_hops) return pcesSchedulePath();
+  return false;   // the one plain PATH after "no path both ways" found nothing either
+}
+
 bool pcesOnBinaryReply(const ContactInfo& contact, const uint8_t* data, size_t len) {
   if (!s_pces || (s_pces->step != PST_INFO_WAIT && s_pces->step != PST_PATH_WAIT) ||
       memcmp(contact.id.pub_key, s_pces->req_server, PUB_KEY_SIZE) != 0) return false;
@@ -863,11 +910,7 @@ bool pcesOnBinaryReply(const ContactInfo& contact, const uint8_t* data, size_t l
   if (ok) s_pces->route_hops = PP::routeFromAnswer(s_pces->plan, s_pces->ans, s_pces->route);
   if (s_pces->run == PRUN_AUTO) {
     if (ok && s_pces->route_hops >= 0) { pcesAutoAnswer(); pcesEndRun(); return true; }
-    if (++s_pces->hop_i < s_pces->n_hops) {   // PCES does not know that first hop: the next one
-      s_pces->step = PST_PATH_SEND; s_pces->attempt = 0; s_pces->send_at = pcesFloorAt();
-    } else {
-      pcesEndRun();
-    }
+    if (!pcesNextPathRequest()) pcesEndRun();   // PCES has nothing from that first hop: the next request
     return true;
   }
   if (ok && s_pces->route_hops >= 0) {
@@ -879,12 +922,8 @@ bool pcesOnBinaryReply(const ContactInfo& contact, const uint8_t* data, size_t l
   char hx[12]; pcesHex(s_pces->hops[s_pces->hop_i].hop, s_pces->width, hx, sizeof hx);
   pcesLog(SET_TONE_WARN, TR("3. From %s: %s"), hx,
           ok ? TR("answer does not start at that hop") : TR(PP::statusText(s_pces->ans.status)));
-  // PCES does not know this first hop (or has no path from it): try the next one.
-  if (++s_pces->hop_i < s_pces->n_hops) {
-    s_pces->step = PST_PATH_SEND;
-    s_pces->attempt = 0;
-    s_pces->send_at = pcesFloorAt();
-  } else {
+  // PCES does not know this first hop (or has no path from it): the next request.
+  if (!pcesNextPathRequest()) {
     pcesLog(SET_TONE_WARN, "%s", TR("No route found from any first hop."));
     pcesEndRun();
   }
@@ -968,7 +1007,7 @@ void pcesTimerCb(lv_timer_t*) {
             char a[12], b[20];
             pcesHex(s_pces->plan.a, s_pces->plan.alen, a, sizeof a);
             pcesHex(s_pces->plan.b, s_pces->plan.blen, b, sizeof b);
-            pcesLog(SET_TONE_INFO, TR("3. Asking PATH %s > %s..."), a, b);
+            pcesLog(SET_TONE_INFO, TR("3. Asking %s %s > %s..."), s_pces->ask_both ? "PATH BOTH WAYS" : "PATH", a, b);
           }
         } else {
           s_pces->send_at = now + 1000;

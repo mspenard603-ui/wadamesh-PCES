@@ -4,7 +4,9 @@
 # A fresh data dir starts at first-run setup; the first tap skips it.
 # Expect: t4 target Diego (BF78 > 7F33), Hilltop picked as server (advertises PCES);
 # t5 steps 1-2 logged (first hop BF78, login, INFO: 42 links, limit -7.50 dB);
-# t6/t7 PATH BF78 > 7F33 after the 12 s floor, 72/100, +6.50 dB, accepted and installed.
+# t6/t7 PATH BOTH WAYS BF78 > 7F33 after the 12 s floor, 60/100, +5.00 dB, good both ways,
+# accepted and installed, return path seeded. WADA_DEMO_PCES_BOTH=none: a plain PATH follows
+# (72/100, scored this way only, not seeded); =old: the same, after "no PATH BOTH WAYS".
 wait 5000
 tap 60 283
 wait 2500

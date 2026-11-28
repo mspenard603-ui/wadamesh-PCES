@@ -469,13 +469,21 @@ private:
         r.push_back(1); r.push_back(q[2]);
         if (q[2] == 0x00) {                // INFO: 7-day window, 42 links, newest 3 min, -7.5 dB, SF11
           r.push_back(0); u16(168); u16(42); u16(3); r.push_back((uint8_t)(int8_t)-30); r.push_back(11);
-        } else if (q[2] == 0x01 && ql >= 6) {   // PATH: A > Lars > B, whatever A and B were
+        } else if ((q[2] == 0x01 || q[2] == 0x03) && ql >= 6) {   // PATH / PATH BOTH WAYS: A > Lars > B
+          // WADA_DEMO_PCES_BOTH: unset, both ways answered too (metric 60: the weaker directions);
+          // "old" = a server from before op 3 (unsupported); "none" = no path measured both ways.
+          const bool both = q[2] == 0x03;
+          const char* bw = getenv("WADA_DEMO_PCES_BOTH");
+          if (both && bw && strcmp(bw, "old") == 0) { r.push_back(9); break; }
+          if (both && bw && strcmp(bw, "none") == 0) { r.push_back(1); break; }
           const uint8_t w = q[3], la = q[4];
           if (w < 1 || w > 3 || ql < 6u + la || la < w) { r.push_back(6); break; }   // bad request
           const uint8_t lb = q[5 + la];
           if (ql < 6u + la + lb) { r.push_back(6); break; }
           uint8_t mid[PUB_KEY_SIZE]; demoKey("Lars", mid);
-          r.push_back(0); r.push_back(72); r.push_back(26);          // metric 72, weakest +6.5 dB
+          r.push_back(0);
+          if (both) { r.push_back(60); r.push_back(20); }          // metric 60, weakest +5 dB
+          else { r.push_back(72); r.push_back(26); }               // metric 72, weakest +6.5 dB
           r.push_back(lb ? 0 : 2);                                  // B = 0 bytes: ends at the station
           r.push_back(lb >= w ? 3 : 2);
           r.insert(r.end(), q + 5, q + 5 + w);

@@ -60,6 +60,21 @@ int main() {
     r = hex("01 01 00 50 80 00 00");
     assert(P::decodePath(r.data(), r.size(), 2, pa) && pa.weakest_snr4 == P::SNR_NONE && pa.hops == 0);
   }
+  // PATH BOTH WAYS (op 3): the same request and answer with op 3; both_ways says which.
+  {
+    const uint8_t a[] = { 0x3A, 0x7D };
+    assert(same(buf, P::encodePath(buf, a, 2, nullptr, 0, 2, true), "C5 01 03 02 02 3A 7D 00"));
+    std::vector<uint8_t> r = hex("01 03 00 32 1D 02 02 3A 7D B4 1E");
+    P::PathAnswer pa;
+    assert(P::decodePath(r.data(), r.size(), 2, pa));
+    assert(pa.both_ways && pa.metric == 50 && pa.hops == 2 && same(pa.hop, 4, "3A7D B41E"));
+    r = hex("01 01 00 50 1D 02 02 3A 7D B4 1E");
+    assert(P::decodePath(r.data(), r.size(), 2, pa) && !pa.both_ways);   // a plain PATH answer
+    r = hex("01 03 09");                     // a server from before op 3
+    assert(!P::decodePath(r.data(), r.size(), 2, pa) && pa.status == P::ST_UNSUPPORTED);
+    r = hex("01 03 01");                     // no path measured both ways
+    assert(!P::decodePath(r.data(), r.size(), 2, pa) && pa.status == P::ST_NO_PATH && pa.both_ways);
+  }
   // LINK and INFO.
   {
     const uint8_t a[] = { 0x3A, 0x7D }, b[] = { 0xB4, 0x1E };
